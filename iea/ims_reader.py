@@ -50,8 +50,7 @@ def _indexed_groups(group: h5py.Group, prefix: str) -> list[h5py.Group]:
     matches = [
         child
         for key in sorted(group.keys(), key=_natural_key)
-        if pattern.fullmatch(key)
-        and isinstance((child := group[key]), h5py.Group)
+        if pattern.fullmatch(key) and isinstance((child := group[key]), h5py.Group)
     ]
     return matches
 
@@ -89,7 +88,7 @@ class IMSReader:
         self._file = None
         self.metadata = None
 
-    def __enter__(self) -> "IMSReader":
+    def __enter__(self) -> IMSReader:
         self.open()
         return self
 
@@ -114,11 +113,7 @@ class IMSReader:
         if not time_points:
             raise IMSReaderError("Invalid IMS structure: no TimePoint groups were found.")
         time_point = next(
-            (
-                group
-                for group in time_points
-                if group.name.rsplit("/", 1)[-1].casefold() == "timepoint 0"
-            ),
+            (group for group in time_points if group.name.rsplit("/", 1)[-1].casefold() == "timepoint 0"),
             None,
         )
         if time_point is None:
@@ -149,9 +144,7 @@ class IMSReader:
             warnings.append("Image dimensions were missing; dataset storage was interpreted as Z, Y, X.")
             axis_order = ("Z", "Y", "X")
         else:
-            sizes, axis_order, size_warning = self._resolve_sizes_from_data(
-                first_data.shape, reported_sizes
-            )
+            sizes, axis_order, size_warning = self._resolve_sizes_from_data(first_data.shape, reported_sizes)
             if size_warning:
                 warnings.append(size_warning)
         axis_warning = self._axis_ambiguity_warning(first_data.shape, sizes, axis_order)
@@ -179,9 +172,7 @@ class IMSReader:
             if channel_warning and channel_warning not in warnings:
                 warnings.append(channel_warning)
             channel_info = self._channel_info_group(dataset_info, index)
-            channels.append(
-                self._parse_channel(index, channel_info, data, channel_axis_order, warnings)
-            )
+            channels.append(self._parse_channel(index, channel_info, data, channel_axis_order, warnings))
 
         size_x, size_y, size_z = sizes["X"], sizes["Y"], sizes["Z"]
         return IMSMetadata(
@@ -300,16 +291,11 @@ class IMSReader:
             if tuple(sizes[axis] for axis in order) == tuple(shape)
         ]
         if len(candidates) > 1:
-            return (
-                f"Axis order is ambiguous for shape {tuple(shape)}; "
-                f"selected storage order {', '.join(selected)}."
-            )
+            return f"Axis order is ambiguous for shape {tuple(shape)}; selected storage order {', '.join(selected)}."
         return None
 
     @staticmethod
-    def _infer_axis_order(
-        shape: tuple[int, ...], sizes: dict[str, int]
-    ) -> tuple[tuple[str, str, str], str | None]:
+    def _infer_axis_order(shape: tuple[int, ...], sizes: dict[str, int]) -> tuple[tuple[str, str, str], str | None]:
         candidates = [
             order
             for order in itertools.permutations(("Z", "Y", "X"))
@@ -324,10 +310,7 @@ class IMSReader:
         selected = preferred if preferred in candidates else candidates[0]
         warning = None
         if len(candidates) > 1:
-            warning = (
-                f"Axis order is ambiguous for shape {tuple(shape)}; "
-                f"selected storage order {', '.join(selected)}."
-            )
+            warning = f"Axis order is ambiguous for shape {tuple(shape)}; selected storage order {', '.join(selected)}."
         return selected, warning
 
     @staticmethod
@@ -402,8 +385,7 @@ class IMSReader:
             raise IMSReaderError(f"Channel index {channel_index} is out of range.")
         if not 1 <= z_start <= z_end <= metadata.size_z:
             raise IMSReaderError(
-                f"Z range must satisfy 1 <= start <= end <= {metadata.size_z}; "
-                f"received {z_start}..{z_end}."
+                f"Z range must satisfy 1 <= start <= end <= {metadata.size_z}; received {z_start}..{z_end}."
             )
 
         channel = metadata.channels[channel_index]
@@ -414,6 +396,55 @@ class IMSReader:
         selected = np.asarray(data[tuple(selection)])
         transpose_axes = tuple(channel.axis_order.index(axis) for axis in ("Z", "Y", "X"))
         return np.transpose(selected, axes=transpose_axes)
+
+    def project_z_range(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]:
+        """Calculate a Z maximum projection without loading the full stack."""
+
+        metadata = self.metadata
+        h5_file = self._require_file()
+        if metadata is None:
+            raise IMSReaderError("IMS metadata has not been parsed.")
+        if not 0 <= channel_index < metadata.channel_count:
+            raise IMSReaderError(f"Channel index {channel_index} is out of range.")
+        if not 1 <= z_start <= z_end <= metadata.size_z:
+            raise IMSReaderError(
+                f"Z range must satisfy 1 <= start <= end <= {metadata.size_z}; received {z_start}..{z_end}."
+            )
+        if chunk_depth <= 0:
+            raise IMSReaderError("Projection chunk depth must be greater than zero.")
+
+        channel = metadata.channels[channel_index]
+        data = h5_file[channel.dataset_path]
+        z_axis = channel.axis_order.index("Z")
+        transpose_axes = tuple(channel.axis_order.index(axis) for axis in ("Z", "Y", "X"))
+        projection: np.ndarray | None = None
+        data_min: float | None = None
+        data_max: float | None = None
+        for chunk_start in range(z_start - 1, z_end, chunk_depth):
+            chunk_end = min(chunk_start + chunk_depth, z_end)
+            selection: list[slice] = [slice(None), slice(None), slice(None)]
+            selection[z_axis] = slice(chunk_start, chunk_end)
+            selected = np.asarray(data[tuple(selection)])
+            chunk_zyx = np.transpose(selected, axes=transpose_axes)
+            chunk_projection = np.max(chunk_zyx, axis=0)
+            if projection is None:
+                projection = chunk_projection.copy()
+            else:
+                np.maximum(projection, chunk_projection, out=projection)
+            chunk_minimum = float(np.min(chunk_zyx))
+            chunk_maximum = float(np.max(chunk_zyx))
+            data_min = chunk_minimum if data_min is None else min(data_min, chunk_minimum)
+            data_max = chunk_maximum if data_max is None else max(data_max, chunk_maximum)
+
+        if projection is None or data_min is None or data_max is None:
+            raise IMSReaderError("The selected Z range did not contain image data.")
+        return projection, data_min, data_max
 
     def inspect_hdf5_structure(self) -> str:
         """Return groups, datasets, and normalized attributes for diagnostics."""

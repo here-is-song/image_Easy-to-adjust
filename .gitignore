@@ -1,7 +1,26 @@
+.venv/
+.idea/
+tests/.idea/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-*.csv
-*.tif
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local microscopy data and generated exports
 *.ims
+*.tif
+*.tiff
 *.png
+*.csv
+*_Export/
+IMS_test_export/
+export_info*.json
+
+# Windows shortcuts contain machine-specific absolute paths
+*.lnk

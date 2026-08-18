@@ -1,6 +1,6 @@
 import numpy as np
 
-from app.color_mapping import additive_merge, apply_pseudocolor, convert_red_to_magenta
+from iea.color_mapping import additive_merge, apply_pseudocolor, convert_red_to_magenta
 
 
 def test_red_becomes_magenta_but_green_is_unchanged():

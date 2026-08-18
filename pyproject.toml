@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image_easy-to-adjust"
+version = "0.2.0"
+description = "IMS projection, preview, batch adjustment, and publication image export"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "h5py>=3.9",
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "PySide6>=6.7",
+    "tifffile>=2023.9.26",
+]
+
+[project.scripts]
+iea = "iea.cli:main"
+
+[project.gui-scripts]
+iea-gui = "iea.gui:launch_gui"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+package = [
+    "pyinstaller>=6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["iea*"]
+
+[tool.setuptools.package-data]
+iea = ["resources/*.ico"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

@@ -22,9 +22,7 @@ def apply_display_adjustment(
     if display_max <= display_min:
         raise ValueError("display_max must be greater than display_min.")
     source = np.asarray(image)
-    normalized = (source.astype(np.float32, copy=False) - display_min) / (
-        display_max - display_min
-    )
+    normalized = (source.astype(np.float32, copy=False) - display_min) / (display_max - display_min)
     normalized = np.clip(normalized, 0.0, 1.0)
     return np.rint(normalized * 255.0).astype(np.uint8)
 

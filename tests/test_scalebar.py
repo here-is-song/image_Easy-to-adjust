@@ -1,6 +1,6 @@
 import numpy as np
 
-from app.scalebar import choose_auto_scale_bar_um, draw_scale_bar, scale_bar_pixels
+from iea.scalebar import choose_auto_scale_bar_um, draw_scale_bar, scale_bar_pixels
 
 
 def test_scale_bar_pixel_length():

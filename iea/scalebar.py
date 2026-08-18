@@ -8,7 +8,6 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageDraw, ImageFont
 
-
 SCALE_BAR_CANDIDATES_UM: tuple[float, ...] = (
     1,
     2,
@@ -64,6 +63,7 @@ def draw_scale_bar(
     scale_bar_um: float | None = None,
     thickness_px: int | None = None,
     font_size_px: int | None = None,
+    content_box: tuple[int, int, int, int] | None = None,
 ) -> tuple[NDArray[np.uint8], float]:
     """Draw a white, bottom-right scale bar and label on a copy of an image."""
 
@@ -73,15 +73,18 @@ def draw_scale_bar(
     if array.ndim == 3 and array.shape[2] != 3:
         raise ValueError("Color image must have exactly three RGB channels.")
     height, width = array.shape[:2]
+    left, top, right, bottom = content_box or (0, 0, width, height)
+    if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        raise ValueError("Scale-bar content box must lie inside the image.")
+    content_width = right - left
+    content_height = bottom - top
     chosen_um = (
-        choose_auto_scale_bar_um(width, voxel_size_x_um)
-        if scale_bar_um is None
-        else float(scale_bar_um)
+        choose_auto_scale_bar_um(content_width, voxel_size_x_um) if scale_bar_um is None else float(scale_bar_um)
     )
     bar_width = scale_bar_pixels(chosen_um, voxel_size_x_um)
-    margin_x = max(4, int(round(width * 0.03)))
-    margin_y = max(4, int(round(height * 0.03)))
-    if bar_width > width - 2 * margin_x:
+    margin_x = max(4, int(round(content_width * 0.03)))
+    margin_y = max(4, int(round(content_height * 0.03)))
+    if bar_width > content_width - 2 * margin_x:
         raise ValueError("Scale bar is wider than the available image area.")
 
     pil_image = Image.fromarray(array.copy())
@@ -91,21 +94,13 @@ def draw_scale_bar(
         raise ValueError("Scale-bar thickness must be positive when specified.")
     if font_size_px is not None and font_size_px <= 0:
         raise ValueError("Scale-bar font size must be positive when specified.")
-    thickness = (
-        int(thickness_px)
-        if thickness_px is not None
-        else max(3, int(round(height * 0.004)))
-    )
-    x_right = width - margin_x
+    thickness = int(thickness_px) if thickness_px is not None else max(3, int(round(content_height * 0.004)))
+    x_right = right - margin_x
     x_left = x_right - bar_width
-    y_bar = height - margin_y - thickness
+    y_bar = bottom - margin_y - thickness
     draw.rectangle((x_left, y_bar, x_right, y_bar + thickness - 1), fill=white)
 
-    font_size = (
-        int(font_size_px)
-        if font_size_px is not None
-        else max(10, int(round(height * 0.035)))
-    )
+    font_size = int(font_size_px) if font_size_px is not None else max(10, int(round(content_height * 0.035)))
     font = _load_font(font_size)
     label_value = int(chosen_um) if chosen_um.is_integer() else chosen_um
     label = f"{label_value} µm"
@@ -113,6 +108,6 @@ def draw_scale_bar(
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
     text_x = int(round((x_left + x_right - text_width) / 2))
-    text_y = max(0, y_bar - text_height - max(2, thickness))
+    text_y = max(top, y_bar - text_height - max(2, thickness))
     draw.text((text_x, text_y), label, fill=white, font=font)
     return np.asarray(pil_image), chosen_um

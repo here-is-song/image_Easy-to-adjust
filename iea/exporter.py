@@ -4,19 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
 import tifffile
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .color_mapping import additive_merge, apply_pseudocolor, convert_red_to_magenta
 from .display_adjustment import apply_display_adjustment, resolve_display_range
 from .ims_reader import IMSReader, IMSReaderError
 from .models import ChannelMetadata, ExportSettings
-from .projection import maximum_intensity_projection
 from .scalebar import draw_scale_bar
 
 
@@ -28,7 +27,7 @@ class ExportResult:
     shape: tuple[int, ...]
     dtype: str
     scale_bar_um: float | None
-    channel_records: tuple["ChannelExportRecord", ...] = ()
+    channel_records: tuple[ChannelExportRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,14 +62,23 @@ def _normalized_output_format(value: str) -> str:
     raise IMSReaderError(f"Unsupported output format: {value}. Choose tif or png.")
 
 
-def _write_output_image(path: Path, image: np.ndarray, output_format: str) -> None:
+def _write_output_image(path: Path, image: np.ndarray, output_format: str, output_dpi: int) -> None:
     """Write one lossless 8-bit grayscale or RGB figure image."""
 
+    if output_dpi <= 0:
+        raise IMSReaderError("Output DPI must be greater than zero.")
     if output_format == "tif":
         photometric = "minisblack" if image.ndim == 2 else "rgb"
-        tifffile.imwrite(path, image, photometric=photometric, metadata=None)
+        tifffile.imwrite(
+            path,
+            image,
+            photometric=photometric,
+            metadata=None,
+            resolution=(output_dpi, output_dpi),
+            resolutionunit="INCH",
+        )
     else:
-        Image.fromarray(image).save(path, format="PNG")
+        Image.fromarray(image).save(path, format="PNG", dpi=(output_dpi, output_dpi))
 
 
 def _available_path(path: Path) -> Path:
@@ -92,11 +100,12 @@ def _project_and_adjust(
     z_end: int,
     display_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    raw_stack = reader.read_z_range(channel.index, z_start, z_end)
-    # Scientific order: raw intensity -> Z projection -> display adjustment.
-    projection = maximum_intensity_projection(raw_stack)
+    # Scientific order: raw intensity -> chunked Z projection -> display adjustment.
+    projection, data_min, data_max = reader.project_z_range(channel.index, z_start, z_end)
     display_min, display_max = display_range or resolve_display_range(
-        channel.display_min, channel.display_max, raw_stack
+        channel.display_min,
+        channel.display_max,
+        np.asarray([data_min, data_max]),
     )
     return apply_display_adjustment(projection, display_min, display_max), display_min, display_max
 
@@ -141,13 +150,34 @@ def render_merge(
         raise IMSReaderError("Open the IMS file before rendering.")
     if not settings.channel_indices:
         raise IMSReaderError("At least one channel must be selected.")
+    rendered = render_selected_channels(reader, settings, display_ranges)
+    return merge_rendered_channels(rendered, settings)
+
+
+def render_selected_channels(
+    reader: IMSReader,
+    settings: ExportSettings,
+    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+) -> dict[int, tuple[np.ndarray, ChannelExportRecord]]:
+    """Render every selected grayscale channel once for reuse by all outputs."""
+
     range_overrides = display_ranges or {}
+    return {
+        channel_index: render_single_channel(reader, settings, channel_index, range_overrides.get(channel_index))
+        for channel_index in settings.channel_indices
+    }
+
+
+def merge_rendered_channels(
+    rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
+    settings: ExportSettings,
+) -> tuple[np.ndarray, tuple[ChannelExportRecord, ...]]:
+    """Create an RGB merge from already-rendered grayscale channels."""
+
     pseudocolor_images: list[np.ndarray] = []
     records: list[ChannelExportRecord] = []
     for channel_index in settings.channel_indices:
-        grayscale, record = render_single_channel(
-            reader, settings, channel_index, range_overrides.get(channel_index)
-        )
+        grayscale, record = rendered[channel_index]
         output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
         pseudocolor_images.append(apply_pseudocolor(grayscale, output_color))
         records.append(
@@ -163,51 +193,26 @@ def render_merge(
     return additive_merge(pseudocolor_images), tuple(records)
 
 
-def _with_optional_scale_bar(
-    image: np.ndarray,
+def _export_rendered_single_channels(
     reader: IMSReader,
     settings: ExportSettings,
-) -> tuple[np.ndarray, float | None]:
-    if not settings.add_scale_bar:
-        return image, None
-    if reader.metadata is None:
-        raise IMSReaderError("IMS metadata is unavailable.")
-    return draw_scale_bar(
-        image,
-        voxel_size_x_um=reader.metadata.voxel_size_x_um,
-        scale_bar_um=settings.scale_bar_um,
-        thickness_px=settings.scale_bar_thickness_px,
-        font_size_px=settings.scale_bar_font_size_px,
-    )
-
-
-def export_single_channels(
-    reader: IMSReader,
-    settings: ExportSettings,
-    output_directory: str | Path | None = None,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
+    output_directory: str | Path | None,
 ) -> list[ExportResult]:
-    """Export selected channels as independent 8-bit grayscale images."""
-
     metadata = reader.metadata
     if metadata is None:
         raise IMSReaderError("Open the IMS file before exporting.")
-    if not settings.channel_indices:
-        raise IMSReaderError("At least one channel must be selected.")
     output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_name = sanitize_filename_component(metadata.source_path.stem)
-    output_format = _normalized_output_format(settings.output_format)
+    output_format = _normalized_output_format(settings.output.format)
     results: list[ExportResult] = []
-    range_overrides = display_ranges or {}
     for channel_index in settings.channel_indices:
-        adjusted, record = render_single_channel(
-            reader, settings, channel_index, range_overrides.get(channel_index)
-        )
-        output_image, chosen_scale = _with_optional_scale_bar(adjusted, reader, settings)
+        adjusted, record = rendered[channel_index]
+        output_image, chosen_scale = prepare_output_image(adjusted, reader, settings)
         filename = f"{source_name}_{sanitize_filename_component(record.name)}.{output_format}"
         output_path = _available_path(output_dir / filename)
-        _write_output_image(output_path, output_image, output_format)
+        _write_output_image(output_path, output_image, output_format, settings.output.dpi)
         results.append(
             ExportResult(
                 output_path,
@@ -220,6 +225,115 @@ def export_single_channels(
     return results
 
 
+def _export_rendered_merge(
+    reader: IMSReader,
+    settings: ExportSettings,
+    rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
+    output_directory: str | Path | None,
+) -> ExportResult:
+    metadata = reader.metadata
+    if metadata is None:
+        raise IMSReaderError("Open the IMS file before exporting.")
+    merged, channel_records = merge_rendered_channels(rendered, settings)
+    output_image, chosen_scale = prepare_output_image(merged, reader, settings)
+    output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_name = sanitize_filename_component(metadata.source_path.stem)
+    output_format = _normalized_output_format(settings.output.format)
+    output_path = _available_path(output_dir / f"{source_name}_Merge.{output_format}")
+    _write_output_image(output_path, output_image, output_format, settings.output.dpi)
+    return ExportResult(
+        output_path,
+        output_image.shape,
+        str(output_image.dtype),
+        chosen_scale,
+        channel_records,
+    )
+
+
+def _resize_for_output(
+    image: np.ndarray, settings: ExportSettings
+) -> tuple[np.ndarray, float, tuple[int, int, int, int]]:
+    width = settings.output.width_px
+    height = settings.output.height_px
+    if width is None and height is None:
+        return image, 1.0, (0, 0, image.shape[1], image.shape[0])
+    if width is None or height is None or width <= 0 or height <= 0:
+        raise IMSReaderError("Output width and height must both be greater than zero.")
+    if image.shape[1] == width and image.shape[0] == height:
+        return image, 1.0, (0, 0, width, height)
+    mode = settings.output.resize_mode
+    if mode not in {"fit", "stretch", "crop"}:
+        raise IMSReaderError(f"Unsupported resize mode: {mode}.")
+    source_height, source_width = image.shape[:2]
+    pil_image = Image.fromarray(image)
+    if mode == "stretch":
+        resized = pil_image.resize((width, height), Image.Resampling.LANCZOS)
+        return (
+            np.asarray(resized).copy(),
+            width / source_width,
+            (0, 0, width, height),
+        )
+    if mode == "crop":
+        resized = ImageOps.fit(pil_image, (width, height), method=Image.Resampling.LANCZOS)
+        return (
+            np.asarray(resized).copy(),
+            max(width / source_width, height / source_height),
+            (0, 0, width, height),
+        )
+
+    scale = min(width / source_width, height / source_height)
+    content_width = max(1, round(source_width * scale))
+    content_height = max(1, round(source_height * scale))
+    resized = pil_image.resize((content_width, content_height), Image.Resampling.LANCZOS)
+    canvas_mode = "L" if image.ndim == 2 else "RGB"
+    canvas = Image.new(canvas_mode, (width, height), color=0)
+    left = (width - content_width) // 2
+    top = (height - content_height) // 2
+    canvas.paste(resized, (left, top))
+    return (
+        np.asarray(canvas).copy(),
+        scale,
+        (left, top, left + content_width, top + content_height),
+    )
+
+
+def prepare_output_image(
+    image: np.ndarray,
+    reader: IMSReader,
+    settings: ExportSettings,
+) -> tuple[np.ndarray, float | None]:
+    """Resize a rendered image and draw its scale bar at final-output resolution."""
+
+    output_image, scale_x, content_box = _resize_for_output(image, settings)
+    if not settings.scale_bar.enabled:
+        return output_image, None
+    if reader.metadata is None:
+        raise IMSReaderError("IMS metadata is unavailable.")
+    return draw_scale_bar(
+        output_image,
+        voxel_size_x_um=(reader.metadata.extent_x_um / image.shape[1]) / scale_x,
+        scale_bar_um=settings.scale_bar.length_um,
+        thickness_px=settings.scale_bar.thickness_px,
+        font_size_px=settings.scale_bar.font_size_px,
+        content_box=content_box,
+    )
+
+
+def export_single_channels(
+    reader: IMSReader,
+    settings: ExportSettings,
+    output_directory: str | Path | None = None,
+    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+) -> list[ExportResult]:
+    """Export selected channels as independent 8-bit grayscale images."""
+
+    if not settings.channel_indices:
+        raise IMSReaderError("At least one channel must be selected.")
+    rendered = render_selected_channels(reader, settings, display_ranges)
+    return _export_rendered_single_channels(reader, settings, rendered, output_directory)
+
+
 def export_merge(
     reader: IMSReader,
     settings: ExportSettings,
@@ -228,24 +342,24 @@ def export_merge(
 ) -> ExportResult:
     """Export selected channels as an additive, 8-bit RGB pseudocolor image."""
 
-    metadata = reader.metadata
-    if metadata is None:
-        raise IMSReaderError("Open the IMS file before exporting.")
-    merged, channel_records = render_merge(reader, settings, display_ranges)
-    output_image, chosen_scale = _with_optional_scale_bar(merged, reader, settings)
-    output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    source_name = sanitize_filename_component(metadata.source_path.stem)
-    output_format = _normalized_output_format(settings.output_format)
-    output_path = _available_path(output_dir / f"{source_name}_Merge.{output_format}")
-    _write_output_image(output_path, output_image, output_format)
-    return ExportResult(
-        output_path,
-        output_image.shape,
-        str(output_image.dtype),
-        chosen_scale,
-        channel_records,
-    )
+    rendered = render_selected_channels(reader, settings, display_ranges)
+    return _export_rendered_merge(reader, settings, rendered, output_directory)
+
+
+def export_channels_and_merge(
+    reader: IMSReader,
+    settings: ExportSettings,
+    output_directory: str | Path | None = None,
+    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+) -> list[ExportResult]:
+    """Export grayscale channels and a merge while projecting each channel once."""
+
+    if not settings.channel_indices:
+        raise IMSReaderError("At least one channel must be selected.")
+    rendered = render_selected_channels(reader, settings, display_ranges)
+    results = _export_rendered_single_channels(reader, settings, rendered, output_directory)
+    results.append(_export_rendered_merge(reader, settings, rendered, output_directory))
+    return results
 
 
 def write_export_info(
@@ -289,10 +403,14 @@ def write_export_info(
         "selected_thickness_um": (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um,
         "projection": "maximum",
         "scale_bar_um": scale_bar_um,
-        "scale_bar_thickness_px": settings.scale_bar_thickness_px,
-        "scale_bar_font_size_px": settings.scale_bar_font_size_px,
+        "scale_bar_thickness_px": settings.scale_bar.thickness_px,
+        "scale_bar_font_size_px": settings.scale_bar.font_size_px,
         "red_to_magenta": settings.red_to_magenta,
-        "output_format": _normalized_output_format(settings.output_format),
+        "output_format": _normalized_output_format(settings.output.format),
+        "output_width_px": settings.output.width_px,
+        "output_height_px": settings.output.height_px,
+        "output_dpi": settings.output.dpi,
+        "resize_mode": settings.output.resize_mode,
         "channels": channel_info,
         "output_files": [str(result.path) for result in results],
     }

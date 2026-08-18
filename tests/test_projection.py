@@ -1,7 +1,7 @@
 import numpy as np
 
-from app.display_adjustment import apply_display_adjustment
-from app.projection import maximum_intensity_projection
+from iea.display_adjustment import apply_display_adjustment
+from iea.projection import maximum_intensity_projection
 
 
 def test_maximum_intensity_projection():

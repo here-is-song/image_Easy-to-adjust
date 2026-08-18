@@ -8,9 +8,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 
-def convert_red_to_magenta(
-    color: tuple[float, float, float], enabled: bool = True
-) -> tuple[float, float, float]:
+def convert_red_to_magenta(color: tuple[float, float, float], enabled: bool = True) -> tuple[float, float, float]:
     """Convert red-like colors to magenta using the Phase 1 threshold."""
 
     r, g, b = color
@@ -19,9 +17,7 @@ def convert_red_to_magenta(
     return color
 
 
-def apply_pseudocolor(
-    grayscale: ArrayLike, color: tuple[float, float, float]
-) -> NDArray[np.float32]:
+def apply_pseudocolor(grayscale: ArrayLike, color: tuple[float, float, float]) -> NDArray[np.float32]:
     """Colorize a uint8 grayscale image as float RGB in the range 0..1."""
 
     intensity = np.asarray(grayscale, dtype=np.float32)

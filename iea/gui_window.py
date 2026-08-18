@@ -1,0 +1,954 @@
+"""PySide6 desktop interface for the IMS figure exporter."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Slot
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QDesktopServices,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .exporter import default_output_directory
+from .gui_dialogs import ExportImageSettingsDialog
+from .gui_workers import BatchExportOutcome, ExportWorker, PreviewWorker
+from .ims_reader import IMSReader, IMSReaderError
+from .models import (
+    ChannelSelection,
+    ExportSettings,
+    ImageOutputSettings,
+    IMSMetadata,
+    ScaleBarSettings,
+)
+from .settings_store import SettingsStore
+
+
+@dataclass
+class ChannelControls:
+    """Widgets associated with one channel; parsing remains outside the GUI layer."""
+
+    include: QCheckBox
+    minimum: QDoubleSpinBox
+    maximum: QDoubleSpinBox
+    use_data_minmax: QCheckBox | None = None
+
+
+class IMSFigureExporterWindow(QMainWindow):
+    """Main window for opening IMS data, inspecting settings, previewing, and export."""
+
+    def __init__(self, app_settings: QSettings | None = None) -> None:
+        super().__init__()
+        self.settings_store = SettingsStore(app_settings)
+        stored = self.settings_store.load()
+        self.metadata: IMSMetadata | None = None
+        self.batch_metadata: dict[Path, IMSMetadata] = {}
+        self.channel_controls: dict[int, ChannelControls] = {}
+        self.output_directory = stored.gui.output_directory
+        self.output_width_px = stored.output.width_px or 1000
+        self.output_height_px = stored.output.height_px or 1000
+        self.output_dpi = stored.output.dpi
+        self.output_format = stored.output.format
+        self.output_resize_mode = stored.output.resize_mode
+        self.copy_to_clipboard = stored.gui.copy_to_clipboard
+        self.preview_refresh_interval_ms = stored.gui.preview_refresh_interval_ms
+        self.last_output_directory: Path | None = None
+        self._thread: QThread | None = None
+        self._worker: QObject | None = None
+        self.preview_pixmap: QPixmap | None = None
+        self.preview_zoom = 1.0
+        self._preview_refresh_pending = False
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._run_scheduled_preview)
+        self._build_ui()
+
+    def _save_export_settings(self) -> None:
+        self.settings_store.save_export(
+            ImageOutputSettings(
+                format=self.output_format,
+                width_px=self.output_width_px,
+                height_px=self.output_height_px,
+                dpi=self.output_dpi,
+                resize_mode=self.output_resize_mode,
+            ),
+            self.output_directory,
+            self.copy_to_clipboard,
+        )
+
+    def _build_menu_bar(self) -> None:
+        """Create a conventional menu structure that can grow with future features."""
+
+        file_menu = self.menuBar().addMenu("&File")
+        self.open_action = QAction("Open IMS Files…", self)
+        self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.open_action.triggered.connect(self.open_ims)
+        file_menu.addAction(self.open_action)
+
+        self.open_output_action = QAction("Open Output Folder", self)
+        self.open_output_action.setEnabled(False)
+        self.open_output_action.triggered.connect(self.open_output_folder)
+        file_menu.addAction(self.open_output_action)
+        file_menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        preview_menu = self.menuBar().addMenu("&Preview")
+        self.refresh_preview_action = QAction("Refresh Preview", self)
+        self.refresh_preview_action.setShortcut(QKeySequence.StandardKey.Refresh)
+        self.refresh_preview_action.setEnabled(False)
+        self.refresh_preview_action.triggered.connect(self.update_preview)
+        preview_menu.addAction(self.refresh_preview_action)
+
+        refresh_limit_menu = preview_menu.addMenu("Refresh Limit")
+        self.refresh_limit_group = QActionGroup(self)
+        self.refresh_limit_group.setExclusive(True)
+        self.refresh_limit_actions: dict[int, QAction] = {}
+        for label, interval_ms in (
+            ("2 per second", 500),
+            ("1 per second", 1000),
+            ("Every 2 seconds", 2000),
+            ("Every 5 seconds", 5000),
+        ):
+            action = QAction(label, self, checkable=True)
+            action.setData(interval_ms)
+            action.setChecked(interval_ms == self.preview_refresh_interval_ms)
+            action.triggered.connect(self._refresh_limit_action_triggered)
+            self.refresh_limit_group.addAction(action)
+            refresh_limit_menu.addAction(action)
+            self.refresh_limit_actions[interval_ms] = action
+
+        batch_menu = self.menuBar().addMenu("&Batch")
+        select_process_all = QAction("Select All for Processing", self)
+        select_process_all.triggered.connect(lambda: self._set_batch_column_checked(1, True))
+        batch_menu.addAction(select_process_all)
+        clear_process = QAction("Clear Processing Selection", self)
+        clear_process.triggered.connect(lambda: self._set_batch_column_checked(1, False))
+        batch_menu.addAction(clear_process)
+        batch_menu.addSeparator()
+        select_export_all = QAction("Select All for Export", self)
+        select_export_all.triggered.connect(lambda: self._set_batch_column_checked(2, True))
+        batch_menu.addAction(select_export_all)
+        clear_export = QAction("Clear Export Selection", self)
+        clear_export.triggered.connect(lambda: self._set_batch_column_checked(2, False))
+        batch_menu.addAction(clear_export)
+
+        export_menu = self.menuBar().addMenu("&Export")
+        self.export_settings_action = QAction("Export Image Settings…", self)
+        self.export_settings_action.triggered.connect(self.open_export_settings)
+        export_menu.addAction(self.export_settings_action)
+        export_menu.addSeparator()
+        self.export_action = QAction("Export Images", self)
+        self.export_action.setShortcut(QKeySequence("Ctrl+C"))
+        self.export_action.setEnabled(False)
+        self.export_action.triggered.connect(self.export_tiffs)
+        export_menu.addAction(self.export_action)
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("image_easy-to-adjust (IEA)")
+        icon_path = Path(__file__).resolve().parent / "resources" / "IEA.ico"
+        if icon_path.exists():
+            application_icon = QIcon(str(icon_path))
+            self.setWindowIcon(application_icon)
+            application = QApplication.instance()
+            if application is not None:
+                application.setWindowIcon(application_icon)
+        self.resize(1200, 780)
+        self._build_menu_bar()
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        file_row = QHBoxLayout()
+        self.open_button = QPushButton("Open IMS Files…")
+        self.open_button.clicked.connect(self.open_ims)
+        self.file_label = QLabel("No IMS file selected")
+        self.file_label.setWordWrap(True)
+        file_row.addWidget(self.open_button)
+        file_row.addWidget(self.file_label, 1)
+        root.addLayout(file_row)
+        self.metadata_label = QLabel("Open an IMS file to view metadata.")
+        root.addWidget(self.metadata_label)
+        self.warning_label = QLabel()
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet("color: #9a6700;")
+        root.addWidget(self.warning_label)
+
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(7)
+        root.addWidget(self.content_splitter, 1)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_panel = QWidget()
+        self.left_layout = QVBoxLayout(left_panel)
+        self.left_layout.setContentsMargins(4, 4, 4, 4)
+        batch_group = QGroupBox("Batch Files")
+        batch_layout = QVBoxLayout(batch_group)
+        self.batch_tree = QTreeWidget()
+        self.batch_tree.setColumnCount(3)
+        self.batch_tree.setHeaderLabels(["IMS file", "Process", "Export"])
+        self.batch_tree.setMinimumHeight(130)
+        self.batch_tree.setRootIsDecorated(False)
+        self.batch_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.batch_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.batch_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.batch_tree.itemSelectionChanged.connect(self._batch_selection_changed)
+        self.batch_tree.itemChanged.connect(self._batch_item_changed)
+        batch_layout.addWidget(self.batch_tree)
+        self.left_layout.addWidget(batch_group)
+        self.channels_group = QGroupBox("Channels")
+        self.channels_layout = QVBoxLayout(self.channels_group)
+        self.left_layout.addWidget(self.channels_group)
+        self._build_settings_groups()
+        self.left_layout.addStretch(1)
+        left_scroll.setWidget(left_panel)
+        left_scroll.setMinimumWidth(260)
+        self.content_splitter.addWidget(left_scroll)
+
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(QLabel("Preview:"))
+        self.preview_combo = QComboBox()
+        self.preview_combo.currentIndexChanged.connect(self._schedule_preview_refresh)
+        preview_header.addWidget(self.preview_combo)
+        self.update_button = QPushButton("Update Preview")
+        self.update_button.clicked.connect(self.update_preview)
+        preview_header.addWidget(self.update_button)
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.setToolTip("Zoom out preview")
+        self.zoom_out_button.clicked.connect(self.zoom_out)
+        preview_header.addWidget(self.zoom_out_button)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.setToolTip("Zoom in preview")
+        self.zoom_in_button.clicked.connect(self.zoom_in)
+        preview_header.addWidget(self.zoom_in_button)
+        self.actual_size_button = QPushButton("100%")
+        self.actual_size_button.clicked.connect(self.actual_size_preview)
+        preview_header.addWidget(self.actual_size_button)
+        self.fit_button = QPushButton("Fit")
+        self.fit_button.clicked.connect(self.fit_preview)
+        preview_header.addWidget(self.fit_button)
+        self.zoom_label = QLabel("100%")
+        preview_header.addWidget(self.zoom_label)
+        preview_header.addStretch(1)
+        preview_layout.addLayout(preview_header)
+        self.preview_label = QLabel("Preview will appear here.")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(1, 1)
+        self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(False)
+        self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_scroll.setWidget(self.preview_label)
+        preview_layout.addWidget(self.preview_scroll, 1)
+        preview_panel.setMinimumWidth(320)
+        self.content_splitter.addWidget(preview_panel)
+        self.content_splitter.setCollapsible(0, False)
+        self.content_splitter.setCollapsible(1, False)
+        self.content_splitter.setStretchFactor(0, 0)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([360, 820])
+        self.content_splitter.handle(1).setToolTip("Drag left or right to resize the settings and preview areas")
+        self.content_splitter.setStyleSheet(
+            "QSplitter::handle { background-color: palette(mid); }"
+            "QSplitter::handle:hover { background-color: palette(highlight); }"
+        )
+
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        bottom.addWidget(self.status_label, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setMaximumWidth(220)
+        bottom.addWidget(self.progress_bar)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_processing)
+        bottom.addWidget(self.cancel_button)
+        self.open_folder_button = QPushButton("Open Folder")
+        self.open_folder_button.setEnabled(False)
+        self.open_folder_button.clicked.connect(self.open_output_folder)
+        bottom.addWidget(self.open_folder_button)
+        self.export_button = QPushButton("Export Images")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_tiffs)
+        bottom.addWidget(self.export_button)
+        root.addLayout(bottom)
+
+    def _build_settings_groups(self) -> None:
+        z_group = QGroupBox("Z Range")
+        z_form = QFormLayout(z_group)
+        self.z_start = QSpinBox()
+        self.z_end = QSpinBox()
+        self.z_start.valueChanged.connect(self._update_z_info)
+        self.z_end.valueChanged.connect(self._update_z_info)
+        self.z_start.valueChanged.connect(self._schedule_preview_refresh)
+        self.z_end.valueChanged.connect(self._schedule_preview_refresh)
+        self.z_info = QLabel("Open a file first.")
+        self.z_info.setWordWrap(True)
+        z_form.addRow("Start (slice):", self.z_start)
+        z_form.addRow("End (slice):", self.z_end)
+        z_form.addRow(self.z_info)
+        self.left_layout.addWidget(z_group)
+
+        scale_group = QGroupBox("Scale Bar")
+        scale_form = QFormLayout(scale_group)
+        self.include_scale_bar = QCheckBox("Include scale bar")
+        self.include_scale_bar.setChecked(True)
+        self.include_scale_bar.toggled.connect(self._toggle_scale_controls)
+        self.include_scale_bar.toggled.connect(self._schedule_preview_refresh)
+        self.auto_scale = QCheckBox("Auto scale bar")
+        self.auto_scale.setChecked(True)
+        self.auto_scale.toggled.connect(self._toggle_scale_length)
+        self.auto_scale.toggled.connect(self._schedule_preview_refresh)
+        self.scale_length = QDoubleSpinBox()
+        self.scale_length.setSuffix(" um")
+        self.scale_length.setRange(0.001, 1_000_000)
+        self.scale_length.setValue(50)
+        self.scale_length.setEnabled(False)
+        self.scale_length.valueChanged.connect(self._schedule_preview_refresh)
+        self.scale_thickness = QSpinBox()
+        self.scale_thickness.setRange(0, 1000)
+        self.scale_thickness.setSpecialValueText("Auto")
+        self.scale_thickness.setSuffix(" px")
+        self.scale_thickness.valueChanged.connect(self._schedule_preview_refresh)
+        self.scale_font_size = QSpinBox()
+        self.scale_font_size.setRange(0, 1000)
+        self.scale_font_size.setSpecialValueText("Auto")
+        self.scale_font_size.setSuffix(" px")
+        self.scale_font_size.valueChanged.connect(self._schedule_preview_refresh)
+        self.red_to_magenta = QCheckBox("Convert red to magenta")
+        self.red_to_magenta.setChecked(True)
+        self.red_to_magenta.toggled.connect(self._schedule_preview_refresh)
+        scale_form.addRow(self.include_scale_bar)
+        scale_form.addRow(self.auto_scale)
+        scale_form.addRow("Manual length:", self.scale_length)
+        scale_form.addRow("Bar thickness:", self.scale_thickness)
+        scale_form.addRow("Text size:", self.scale_font_size)
+        scale_form.addRow(self.red_to_magenta)
+        self.left_layout.addWidget(scale_group)
+
+    @Slot()
+    def open_export_settings(self) -> None:
+        default_directory = default_output_directory(self.metadata.source_path) if self.metadata is not None else None
+        dialog = ExportImageSettingsDialog(
+            self,
+            self.output_width_px,
+            self.output_height_px,
+            self.output_dpi,
+            self.copy_to_clipboard,
+            self.output_format,
+            self.output_resize_mode,
+            self.output_directory,
+            default_directory,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.output_width_px = dialog.width_spin.value()
+        self.output_height_px = dialog.height_spin.value()
+        self.output_dpi = dialog.dpi_spin.value()
+        self.copy_to_clipboard = dialog.copy_checkbox.isChecked()
+        self.output_format = str(dialog.format_combo.currentData())
+        self.output_resize_mode = str(dialog.resize_mode_combo.currentData())
+        self.output_directory = dialog.selected_output_directory()
+        self.last_output_directory = None
+        self._save_export_settings()
+        self._sync_output_folder_controls()
+        clipboard_text = "on" if self.copy_to_clipboard else "off"
+        self.status_label.setText(
+            f"Export settings: {self.output_width_px} × {self.output_height_px} px, "
+            f"{self.output_dpi} DPI, {self.output_format.upper()}, Clipboard {clipboard_text}."
+        )
+        self._schedule_preview_refresh()
+
+    def _current_output_directory(self) -> Path | None:
+        if self.output_directory is not None:
+            return self.output_directory
+        if self.metadata is not None:
+            return default_output_directory(self.metadata.source_path)
+        return None
+
+    def _sync_output_folder_controls(self) -> None:
+        target = self._current_output_directory()
+        can_open = target is not None and target.exists()
+        self.open_folder_button.setEnabled(can_open)
+        self.open_output_action.setEnabled(can_open)
+
+    @Slot()
+    def open_ims(self) -> None:
+        filenames, _ = QFileDialog.getOpenFileNames(self, "Open IMS files", "", "IMS files (*.ims);;All files (*)")
+        if not filenames:
+            return
+        loaded: dict[Path, IMSMetadata] = {}
+        errors: list[str] = []
+        for filename in filenames:
+            reader = IMSReader(filename)
+            try:
+                metadata = reader.open()
+                loaded[metadata.source_path] = metadata
+            except IMSReaderError as exc:
+                errors.append(f"{Path(filename).name}: {exc}")
+            finally:
+                reader.close()
+        if not loaded:
+            QMessageBox.critical(self, "Unable to open IMS files", "\n".join(errors))
+            return
+
+        self.batch_metadata = loaded
+        self.last_output_directory = None
+        self.batch_tree.blockSignals(True)
+        self.batch_tree.clear()
+        for path in loaded:
+            item = QTreeWidgetItem([path.name, "", ""])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(0, str(path))
+            item.setCheckState(1, Qt.CheckState.Checked)
+            item.setCheckState(2, Qt.CheckState.Checked)
+            self.batch_tree.addTopLevelItem(item)
+        first_item = self.batch_tree.topLevelItem(0)
+        self.batch_tree.setCurrentItem(first_item)
+        self.batch_tree.blockSignals(False)
+        first_path = Path(str(first_item.data(0, Qt.ItemDataRole.UserRole)))
+        self._activate_metadata(loaded[first_path])
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some IMS files were skipped",
+                "The following files could not be opened:\n" + "\n".join(errors),
+            )
+
+    def _activate_metadata(self, metadata: IMSMetadata) -> None:
+        self.metadata = metadata
+        self.file_label.setText(str(metadata.source_path))
+        self.metadata_label.setText(
+            f"{metadata.size_x} x {metadata.size_y} x {metadata.size_z} | "
+            f"{metadata.channel_count} channels | "
+            f"{metadata.voxel_size_x_um:.6g} x {metadata.voxel_size_y_um:.6g} x "
+            f"{metadata.voxel_size_z_um:.6g} um"
+        )
+        self.warning_label.setText("\n".join(metadata.warnings))
+        self._sync_output_folder_controls()
+        self._populate_channels(metadata)
+        self.z_start.setRange(1, metadata.size_z)
+        self.z_end.setRange(1, metadata.size_z)
+        self.z_start.setValue(1)
+        self.z_end.setValue(metadata.size_z)
+        self._update_z_info()
+        self._update_export_enabled()
+        self.refresh_preview_action.setEnabled(True)
+        self.status_label.setText(f"{len(self.batch_metadata)} IMS file(s) loaded. Active: {metadata.source_path.name}")
+        self._preview_timer.stop()
+        self._preview_refresh_pending = False
+        self.update_preview()
+
+    @Slot()
+    def _batch_selection_changed(self) -> None:
+        selected = self.batch_tree.selectedItems()
+        if not selected:
+            return
+        path = Path(str(selected[0].data(0, Qt.ItemDataRole.UserRole)))
+        metadata = self.batch_metadata.get(path)
+        if metadata is not None and metadata is not self.metadata:
+            self._activate_metadata(metadata)
+
+    @Slot(QTreeWidgetItem, int)
+    def _batch_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        self.batch_tree.blockSignals(True)
+        if column == 1 and item.checkState(1) == Qt.CheckState.Unchecked:
+            item.setCheckState(2, Qt.CheckState.Unchecked)
+        elif column == 2 and item.checkState(2) == Qt.CheckState.Checked:
+            item.setCheckState(1, Qt.CheckState.Checked)
+        self.batch_tree.blockSignals(False)
+        self._update_export_enabled()
+
+    def _set_batch_column_checked(self, column: int, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self.batch_tree.blockSignals(True)
+        for index in range(self.batch_tree.topLevelItemCount()):
+            item = self.batch_tree.topLevelItem(index)
+            item.setCheckState(column, state)
+            if column == 1 and not checked:
+                item.setCheckState(2, Qt.CheckState.Unchecked)
+            elif column == 2 and checked:
+                item.setCheckState(1, Qt.CheckState.Checked)
+        self.batch_tree.blockSignals(False)
+        self._update_export_enabled()
+
+    def _selected_export_paths(self) -> tuple[Path, ...]:
+        paths: list[Path] = []
+        for index in range(self.batch_tree.topLevelItemCount()):
+            item = self.batch_tree.topLevelItem(index)
+            if item.checkState(1) == Qt.CheckState.Checked and item.checkState(2) == Qt.CheckState.Checked:
+                paths.append(Path(str(item.data(0, Qt.ItemDataRole.UserRole))))
+        return tuple(paths)
+
+    def _update_export_enabled(self) -> None:
+        enabled = bool(self._selected_export_paths()) and self._thread is None
+        self.export_button.setEnabled(enabled)
+        self.export_action.setEnabled(enabled)
+
+    def _populate_channels(self, metadata: IMSMetadata) -> None:
+        while self.channels_layout.count():
+            item = self.channels_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.channel_controls.clear()
+        for channel in metadata.channels:
+            row = QFrame()
+            row.setFrameShape(QFrame.Shape.StyledPanel)
+            layout = QGridLayout(row)
+            include = QCheckBox(channel.name)
+            include.setChecked(True)
+            swatch = QLabel()
+            rgb = tuple(round(component * 255) for component in channel.color)
+            swatch.setStyleSheet(f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); border: 1px solid #666;")
+            swatch.setFixedSize(18, 18)
+            minimum = self._range_spinbox(channel.display_min, 0.0)
+            maximum = self._range_spinbox(channel.display_max, 1.0)
+            include.toggled.connect(self._schedule_preview_refresh)
+            minimum.valueChanged.connect(self._schedule_preview_refresh)
+            maximum.valueChanged.connect(self._schedule_preview_refresh)
+            use_data_minmax: QCheckBox | None = None
+            source = "IMS ColorRange" if channel.display_range_source == "ims" else "Data min/max fallback"
+            layout.addWidget(include, 0, 0, 1, 2)
+            layout.addWidget(swatch, 0, 2)
+            layout.addWidget(QLabel("Min"), 1, 0)
+            layout.addWidget(minimum, 1, 1)
+            layout.addWidget(QLabel("Max"), 2, 0)
+            layout.addWidget(maximum, 2, 1)
+            layout.addWidget(QLabel(source), 3, 0, 1, 3)
+            if channel.display_range_source != "ims":
+                use_data_minmax = QCheckBox("Use selected data min/max")
+                use_data_minmax.setChecked(True)
+                minimum.setEnabled(False)
+                maximum.setEnabled(False)
+                use_data_minmax.toggled.connect(minimum.setDisabled)
+                use_data_minmax.toggled.connect(maximum.setDisabled)
+                use_data_minmax.toggled.connect(self._schedule_preview_refresh)
+                layout.addWidget(use_data_minmax, 4, 0, 1, 3)
+            self.channels_layout.addWidget(row)
+            self.channel_controls[channel.index] = ChannelControls(include, minimum, maximum, use_data_minmax)
+        self._populate_preview_choices()
+
+    @staticmethod
+    def _range_spinbox(value: float | None, fallback: float) -> QDoubleSpinBox:
+        spinbox = QDoubleSpinBox()
+        spinbox.setDecimals(4)
+        spinbox.setRange(-1_000_000_000_000.0, 1_000_000_000_000.0)
+        spinbox.setValue(value if value is not None else fallback)
+        return spinbox
+
+    def _populate_preview_choices(self) -> None:
+        current = self.preview_combo.currentData()
+        self.preview_combo.blockSignals(True)
+        self.preview_combo.clear()
+        self.preview_combo.addItem("Merge", None)
+        if self.metadata is not None:
+            for channel in self.metadata.channels:
+                self.preview_combo.addItem(channel.name, channel.index)
+        index = self.preview_combo.findData(current)
+        self.preview_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.preview_combo.blockSignals(False)
+
+    @Slot()
+    def _update_z_info(self) -> None:
+        if self.metadata is None:
+            return
+        if self.z_start.value() > self.z_end.value():
+            self.z_end.setValue(self.z_start.value())
+        start = self.z_start.value()
+        end = self.z_end.value()
+        voxel = self.metadata.voxel_size_z_um
+        thickness = (end - start + 1) * voxel
+        self.z_info.setText(
+            f"Start: slice {start} ({self.metadata.origin_z_um + (start - 1) * voxel:.4g} um)\n"
+            f"End: slice {end} ({self.metadata.origin_z_um + (end - 1) * voxel:.4g} um)\n"
+            f"Selected thickness: {thickness:.4g} um"
+        )
+
+    @Slot(bool)
+    def _toggle_scale_length(self, automatic: bool) -> None:
+        self.scale_length.setEnabled(self.include_scale_bar.isChecked() and not automatic)
+
+    @Slot(bool)
+    def _toggle_scale_controls(self, included: bool) -> None:
+        self.auto_scale.setEnabled(included)
+        self.scale_length.setEnabled(included and not self.auto_scale.isChecked())
+        self.scale_thickness.setEnabled(included)
+        self.scale_font_size.setEnabled(included)
+
+    def _current_settings(self, show_warnings: bool = True) -> ExportSettings | None:
+        if self.metadata is None:
+            return None
+        channels = tuple(index for index, controls in self.channel_controls.items() if controls.include.isChecked())
+        if not channels:
+            message = "Select at least one channel before previewing or exporting."
+            if show_warnings:
+                QMessageBox.warning(self, "No channels selected", message)
+            else:
+                self.status_label.setText(message)
+            return None
+        ranges = self._display_ranges()
+        for index in channels:
+            if index not in ranges:
+                continue
+            minimum, maximum = ranges[index]
+            if maximum <= minimum:
+                message = f"Channel {index}: Max must be greater than Min."
+                if show_warnings:
+                    QMessageBox.warning(self, "Invalid display range", message)
+                else:
+                    self.status_label.setText(message)
+                return None
+        return ExportSettings(
+            z_start=self.z_start.value(),
+            z_end=self.z_end.value(),
+            channel_indices=channels,
+            red_to_magenta=self.red_to_magenta.isChecked(),
+            scale_bar=ScaleBarSettings(
+                enabled=self.include_scale_bar.isChecked(),
+                length_um=(None if self.auto_scale.isChecked() else self.scale_length.value()),
+                thickness_px=(None if self.scale_thickness.value() == 0 else self.scale_thickness.value()),
+                font_size_px=(None if self.scale_font_size.value() == 0 else self.scale_font_size.value()),
+            ),
+            output=ImageOutputSettings(
+                format=self.output_format,
+                width_px=self.output_width_px,
+                height_px=self.output_height_px,
+                dpi=self.output_dpi,
+                resize_mode=self.output_resize_mode,
+            ),
+        )
+
+    def _display_ranges(self) -> dict[int, tuple[float, float]]:
+        return {
+            index: (controls.minimum.value(), controls.maximum.value())
+            for index, controls in self.channel_controls.items()
+            if controls.use_data_minmax is None or not controls.use_data_minmax.isChecked()
+        }
+
+    def _channel_selections(self) -> tuple[ChannelSelection, ...]:
+        if self.metadata is None:
+            return ()
+        display_ranges = self._display_ranges()
+        selections: list[ChannelSelection] = []
+        for channel in self.metadata.channels:
+            controls = self.channel_controls[channel.index]
+            if not controls.include.isChecked():
+                continue
+            display_range = display_ranges.get(channel.index)
+            selections.append(
+                ChannelSelection(
+                    index=channel.index,
+                    name=channel.name,
+                    display_min=display_range[0] if display_range else None,
+                    display_max=display_range[1] if display_range else None,
+                )
+            )
+        return tuple(selections)
+
+    @Slot()
+    def update_preview(self) -> None:
+        self._preview_timer.stop()
+        self._preview_refresh_pending = False
+        self._start_preview(show_warnings=True)
+
+    def _start_preview(self, show_warnings: bool) -> None:
+        if self._thread is not None:
+            self._preview_refresh_pending = True
+            self.status_label.setText("Preview refresh queued…")
+            return
+        settings = self._current_settings(show_warnings=show_warnings)
+        if settings is None or self.metadata is None:
+            return
+        selected_preview = self.preview_combo.currentData()
+        if selected_preview is not None and selected_preview not in settings.channel_indices:
+            message = "Select this channel before previewing it."
+            if show_warnings:
+                QMessageBox.warning(self, "Channel not selected", message)
+            else:
+                self.status_label.setText(message)
+            return
+        worker = PreviewWorker(self.metadata.source_path, settings, self._display_ranges(), selected_preview)
+        self._run_worker(worker, self._preview_finished)
+
+    def _schedule_preview_refresh(self, *_: object) -> None:
+        if self.metadata is None:
+            return
+        self._preview_refresh_pending = True
+        self._preview_timer.start(self.preview_refresh_interval_ms)
+        self.status_label.setText("Preview update scheduled…")
+
+    @Slot()
+    def _run_scheduled_preview(self) -> None:
+        if not self._preview_refresh_pending:
+            return
+        if self._thread is not None:
+            return
+        self._preview_refresh_pending = False
+        self._start_preview(show_warnings=False)
+
+    def _refresh_limit_action_triggered(self, *_: object) -> None:
+        action = self.refresh_limit_group.checkedAction()
+        if action is None:
+            return
+        self.preview_refresh_interval_ms = int(action.data())
+        self.settings_store.save_refresh_interval(self.preview_refresh_interval_ms)
+        if self._preview_refresh_pending:
+            self._preview_timer.start(self.preview_refresh_interval_ms)
+        self.status_label.setText(f"Preview refresh limit: {action.text()}.")
+
+    @Slot()
+    def export_tiffs(self) -> None:
+        settings = self._current_settings()
+        if settings is None or self.metadata is None:
+            return
+        source_paths = self._selected_export_paths()
+        if not source_paths:
+            QMessageBox.warning(self, "No files selected", "Select at least one batch file for export.")
+            return
+        worker = ExportWorker(
+            source_paths,
+            settings,
+            self._channel_selections(),
+            self.output_directory,
+        )
+        self._run_worker(worker, self._export_finished)
+
+    def _run_worker(self, worker: QObject, completed_slot: object) -> None:
+        if self._thread is not None:
+            return
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        worker.finished.connect(completed_slot)  # type: ignore[attr-defined]
+        worker.finished.connect(thread.quit)  # type: ignore[attr-defined]
+        worker.failed.connect(self._worker_failed)  # type: ignore[attr-defined]
+        worker.failed.connect(thread.quit)  # type: ignore[attr-defined]
+        if isinstance(worker, ExportWorker):
+            worker.progress.connect(self._export_progress)
+            self.progress_bar.setRange(0, len(worker.source_paths))
+            self.progress_bar.setValue(0)
+            self.cancel_button.setEnabled(True)
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.cancel_button.setEnabled(False)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._worker_finished)
+        self._thread = thread
+        self._worker = worker
+        self.open_button.setEnabled(False)
+        self.open_action.setEnabled(False)
+        self.batch_tree.setEnabled(False)
+        self.export_settings_action.setEnabled(False)
+        self.update_button.setEnabled(False)
+        self.refresh_preview_action.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.export_action.setEnabled(False)
+        self.status_label.setText("Processing…")
+        thread.start()
+
+    @Slot(int, int, str)
+    def _export_progress(self, completed: int, total: int, filename: str) -> None:
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(completed)
+        if filename and completed < total:
+            self.status_label.setText(f"Processing {completed + 1} / {total}: {filename}")
+
+    @Slot()
+    def cancel_processing(self) -> None:
+        if isinstance(self._worker, ExportWorker):
+            self._worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Cancelling after the current file…")
+
+    @Slot(object)
+    def _preview_finished(self, image: object) -> None:
+        array = np.asarray(image)
+        if array.ndim == 2:
+            qimage = QImage(
+                array.data,
+                array.shape[1],
+                array.shape[0],
+                array.strides[0],
+                QImage.Format.Format_Grayscale8,
+            )
+        else:
+            qimage = QImage(
+                array.data,
+                array.shape[1],
+                array.shape[0],
+                array.strides[0],
+                QImage.Format.Format_RGB888,
+            )
+        self.preview_pixmap = QPixmap.fromImage(qimage.copy())
+        self.fit_preview()
+        self.status_label.setText("Preview updated.")
+
+    @Slot()
+    def zoom_in(self) -> None:
+        self._set_preview_zoom(self.preview_zoom * 1.25)
+
+    @Slot()
+    def zoom_out(self) -> None:
+        self._set_preview_zoom(self.preview_zoom / 1.25)
+
+    @Slot()
+    def actual_size_preview(self) -> None:
+        self._set_preview_zoom(1.0)
+
+    @Slot()
+    def fit_preview(self) -> None:
+        if self.preview_pixmap is None or self.preview_pixmap.isNull():
+            return
+        viewport = self.preview_scroll.viewport().size()
+        width_ratio = max(1, viewport.width() - 8) / self.preview_pixmap.width()
+        height_ratio = max(1, viewport.height() - 8) / self.preview_pixmap.height()
+        self._set_preview_zoom(min(width_ratio, height_ratio, 1.0))
+
+    def _set_preview_zoom(self, zoom: float) -> None:
+        if self.preview_pixmap is None or self.preview_pixmap.isNull():
+            return
+        self.preview_zoom = min(8.0, max(0.05, zoom))
+        width = max(1, round(self.preview_pixmap.width() * self.preview_zoom))
+        height = max(1, round(self.preview_pixmap.height() * self.preview_zoom))
+        scaled = self.preview_pixmap.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+        self.preview_label.resize(scaled.size())
+        self.zoom_label.setText(f"{self.preview_zoom * 100:.0f}%")
+
+    @Slot(object)
+    def _export_finished(self, outcome: object) -> None:
+        batch_outcome: BatchExportOutcome = outcome  # type: ignore[assignment]
+        result_list = list(batch_outcome.results)
+        info_paths = list(batch_outcome.info_paths)
+        if info_paths:
+            self.last_output_directory = info_paths[-1].parent
+            self.open_folder_button.setEnabled(True)
+            self.open_output_action.setEnabled(True)
+        clipboard_note = ""
+        clipboard_copied = False
+        if self.copy_to_clipboard and result_list:
+            try:
+                self._copy_image_to_clipboard(result_list[-1].path)
+                clipboard_copied = True
+                clipboard_note = "\nThe merged image was copied to the Clipboard."
+            except Exception as exc:
+                clipboard_note = f"\nClipboard copy failed: {exc}"
+        status_prefix = "Export cancelled" if batch_outcome.cancelled else "Export completed"
+        self.status_label.setText(
+            f"{status_prefix}: {len(result_list)} image files from "
+            f"{len(info_paths)} IMS file(s)." + (" Merged image copied to Clipboard." if clipboard_copied else "")
+        )
+        output_directories = sorted({str(path.parent) for path in info_paths})
+        output_text = "\n".join(output_directories) or "No output files were created."
+        error_text = "\n\nSkipped files:\n" + "\n".join(batch_outcome.errors) if batch_outcome.errors else ""
+        warning_text = (
+            "\n\nCompatibility adjustments:\n" + "\n".join(batch_outcome.warnings) if batch_outcome.warnings else ""
+        )
+        QMessageBox.information(
+            self,
+            status_prefix,
+            f"{len(result_list)} image files from {len(info_paths)} IMS file(s) were created."
+            f"{clipboard_note}\n\nOutput folder(s):\n{output_text}"
+            f"\n\nExport records: {len(info_paths)}{warning_text}{error_text}",
+        )
+
+    @staticmethod
+    def _copy_image_to_clipboard(path: Path) -> None:
+        with Image.open(path) as source:
+            array = np.asarray(source.convert("RGB")).copy()
+        qimage = QImage(
+            array.data,
+            array.shape[1],
+            array.shape[0],
+            array.strides[0],
+            QImage.Format.Format_RGB888,
+        ).copy()
+        QApplication.clipboard().setImage(qimage)
+
+    @Slot(str)
+    def _worker_failed(self, reason: str) -> None:
+        self.status_label.setText("Processing failed.")
+        QMessageBox.critical(self, "Processing failed", reason)
+
+    @Slot()
+    def _worker_finished(self) -> None:
+        self._thread = None
+        self._worker = None
+        self.open_button.setEnabled(True)
+        self.open_action.setEnabled(True)
+        self.batch_tree.setEnabled(True)
+        self.export_settings_action.setEnabled(True)
+        self.update_button.setEnabled(self.metadata is not None)
+        self.refresh_preview_action.setEnabled(self.metadata is not None)
+        self.cancel_button.setEnabled(False)
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+        self._update_export_enabled()
+        if self._preview_refresh_pending:
+            self._preview_timer.start(self.preview_refresh_interval_ms)
+
+    @Slot()
+    def open_output_folder(self) -> None:
+        target = self.last_output_directory or self._current_output_directory()
+        if target is not None and target.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+
+def launch_gui() -> int:
+    """Launch the application and return the Qt event-loop exit code."""
+
+    application = QApplication.instance() or QApplication([])
+    application.setApplicationName("IEA")
+    application.setApplicationDisplayName("image_easy-to-adjust")
+    window = IMSFigureExporterWindow()
+    window.show()
+    return application.exec()

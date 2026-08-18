@@ -1,6 +1,7 @@
 import h5py
+import numpy as np
 
-from app.ims_reader import IMSReader
+from iea.ims_reader import IMSReader
 
 
 def test_reads_normalized_metadata_without_loading_whole_file(sample_ims):
@@ -28,6 +29,16 @@ def test_reads_only_requested_inclusive_z_range(sample_ims):
         assert selected.shape == (2, 4, 5)
         assert selected.dtype.name == "uint16"
         assert selected[:, 0, 0].tolist() == [8, 15]
+
+
+def test_chunked_projection_matches_selected_stack(sample_ims):
+    with IMSReader(sample_ims) as reader:
+        stack = reader.read_z_range(0, 2, 3)
+        projection, data_min, data_max = reader.project_z_range(0, 2, 3, chunk_depth=1)
+
+    assert np.array_equal(projection, np.max(stack, axis=0))
+    assert data_min == 8.0
+    assert data_max == 15.0
 
 
 def test_uses_resolution_level_shape_when_one_metadata_dimension_is_stale(sample_ims):

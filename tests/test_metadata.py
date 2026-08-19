@@ -20,7 +20,35 @@ def test_reads_normalized_metadata_without_loading_whole_file(sample_ims):
         assert metadata.channels[0].color == (0.0, 1.0, 0.0)
         assert metadata.channels[0].display_min == 0.0
         assert metadata.channels[0].display_max == 20.0
+        assert metadata.channels[0].display_gamma == 0.5
+        assert metadata.channels[0].display_gamma_source == "ims"
         assert metadata.channels[0].axis_order == ("Z", "Y", "X")
+        assert metadata.acquisition.recording_date is not None
+        assert metadata.acquisition.recording_date.strftime("%y%m%d") == "260806"
+        assert metadata.acquisition.microscope_manufacturer == "Olympus"
+        assert metadata.acquisition.microscope_model == "FV1200"
+        assert metadata.acquisition.scan_speed_us_per_pixel == 10.0
+        assert metadata.acquisition.objective_name == "Uplansapo"
+        assert metadata.acquisition.objective_magnification == 10.0
+        assert metadata.acquisition.numerical_aperture == 0.4
+        assert metadata.acquisition.z_section_interval_um == 2.0
+        assert metadata.acquisition.scan_zoom == 1.5
+        assert metadata.objective_detection is not None
+        assert metadata.objective_detection.objective_key == "10X"
+        assert metadata.objective_detection.detection_source == "Metadata"
+
+
+def test_missing_gamma_uses_linear_default(sample_ims):
+    with h5py.File(sample_ims, "r+") as h5_file:
+        del h5_file["DataSetInfo/Channel 0"].attrs["GammaCorrection"]
+
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+
+    assert metadata is not None
+    assert metadata.channels[0].display_gamma == 1.0
+    assert metadata.channels[0].display_gamma_source == "default"
+    assert any("Gamma correction not found for Green" in warning for warning in metadata.warnings)
 
 
 def test_reads_only_requested_inclusive_z_range(sample_ims):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .models import ChannelSelection, ExportSettings, IMSMetadata
+from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings, IMSMetadata
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,7 @@ class MatchedBatchSettings:
     """Settings resolved against one target IMS file."""
 
     settings: ExportSettings
-    display_ranges: dict[int, tuple[float, float]]
+    display_adjustments: dict[int, DisplayAdjustmentSettings]
     warnings: tuple[str, ...]
 
 
@@ -32,7 +32,7 @@ def adapt_settings_for_metadata(
         by_name.setdefault(_normalized_channel_name(channel.name), []).append(channel.index)
 
     matched_indices: list[int] = []
-    display_ranges: dict[int, tuple[float, float]] = {}
+    display_adjustments: dict[int, DisplayAdjustmentSettings] = {}
     warnings: list[str] = []
     used_indices: set[int] = set()
     for selection in selections:
@@ -50,8 +50,7 @@ def adapt_settings_for_metadata(
             warnings.append(f"Channel name '{selection.name}' is duplicated; target index {target_index} was used.")
         used_indices.add(target_index)
         matched_indices.append(target_index)
-        if selection.display_range is not None:
-            display_ranges[target_index] = selection.display_range
+        display_adjustments[target_index] = selection.display_adjustment
 
     z_start = min(max(1, base_settings.z_start), metadata.size_z)
     z_end = min(max(z_start, base_settings.z_end), metadata.size_z)
@@ -67,6 +66,6 @@ def adapt_settings_for_metadata(
             z_end=z_end,
             channel_indices=tuple(matched_indices),
         ),
-        display_ranges=display_ranges,
+        display_adjustments=display_adjustments,
         warnings=tuple(warnings),
     )

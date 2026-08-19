@@ -9,6 +9,8 @@ from PySide6.QtCore import QSettings
 
 from .models import GuiPreferences, ImageOutputSettings
 
+SECTION_KEYS = ("batch_files", "channels", "z_range", "objective", "scale_bar")
+
 
 @dataclass(frozen=True)
 class StoredApplicationSettings:
@@ -58,6 +60,9 @@ class SettingsStore:
                 output_directory=(Path(saved_directory) if saved_directory else None),
                 copy_to_clipboard=self.settings.value("export/copy_to_clipboard", False, type=bool),
                 preview_refresh_interval_ms=interval,
+                section_expanded={
+                    key: self.settings.value(f"layout/sections/{key}/expanded", True, type=bool) for key in SECTION_KEYS
+                },
             ),
         )
 
@@ -81,4 +86,10 @@ class SettingsStore:
 
     def save_refresh_interval(self, interval_ms: int) -> None:
         self.settings.setValue("preview/refresh_interval_ms", interval_ms)
+        self.settings.sync()
+
+    def save_section_expanded(self, section_key: str, expanded: bool) -> None:
+        if section_key not in SECTION_KEYS:
+            raise ValueError(f"Unknown collapsible section: {section_key}")
+        self.settings.setValue(f"layout/sections/{section_key}/expanded", expanded)
         self.settings.sync()

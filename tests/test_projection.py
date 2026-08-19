@@ -17,3 +17,13 @@ def test_display_adjustment_expected_mapping_and_no_input_change():
     adjusted = apply_display_adjustment(source, 100, 1100)
     np.testing.assert_array_equal(adjusted, np.asarray([0, 128, 255], dtype=np.uint8))
     np.testing.assert_array_equal(source, original)
+
+
+def test_display_adjustment_applies_imaris_gamma():
+    source = np.asarray([0, 25, 50, 75, 100], dtype=np.uint16)
+
+    brighter_low_intensities = apply_display_adjustment(source, 0, 100, gamma=0.5)
+    darker_low_intensities = apply_display_adjustment(source, 0, 100, gamma=2.0)
+
+    np.testing.assert_array_equal(brighter_low_intensities, np.asarray([0, 128, 180, 221, 255], dtype=np.uint8))
+    np.testing.assert_array_equal(darker_low_intensities, np.asarray([0, 16, 64, 143, 255], dtype=np.uint8))

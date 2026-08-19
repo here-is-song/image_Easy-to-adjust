@@ -39,3 +39,7 @@ def test_cli_inspection_and_full_milestone_export(sample_ims, tmp_path, capsys):
     export_info = json.loads((output_dir / "export_info.json").read_text(encoding="utf-8"))
     assert export_info["z_start_slice"] == 2
     assert export_info["z_end_slice"] == 3
+    summary_path = output_dir / "sample_PPT_summary.txt"
+    assert summary_path.exists()
+    assert "Microscope: Olympus FV1200" in summary_path.read_text(encoding="utf-8")
+    assert "PPT summary:" in captured.out

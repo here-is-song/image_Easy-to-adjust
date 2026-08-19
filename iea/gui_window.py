@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -36,6 +35,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QSplitter,
     QTreeWidget,
@@ -45,16 +45,20 @@ from PySide6.QtWidgets import (
 )
 
 from .exporter import default_output_directory
+from .fv1200_calibration import FV1200_OBJECTIVES
+from .gui_controls import CollapsibleSection
 from .gui_dialogs import ExportImageSettingsDialog
 from .gui_workers import BatchExportOutcome, ExportWorker, PreviewWorker
 from .ims_reader import IMSReader, IMSReaderError
 from .models import (
     ChannelSelection,
+    DisplayAdjustmentSettings,
     ExportSettings,
     ImageOutputSettings,
     IMSMetadata,
     ScaleBarSettings,
 )
+from .objective_detector import apply_manual_objective, detect_objective
 from .settings_store import SettingsStore
 
 
@@ -65,6 +69,10 @@ class ChannelControls:
     include: QCheckBox
     minimum: QDoubleSpinBox
     maximum: QDoubleSpinBox
+    gamma: QDoubleSpinBox
+    minimum_slider: QSlider
+    maximum_slider: QSlider
+    gamma_slider: QSlider
     use_data_minmax: QCheckBox | None = None
 
 
@@ -86,6 +94,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self.output_resize_mode = stored.output.resize_mode
         self.copy_to_clipboard = stored.gui.copy_to_clipboard
         self.preview_refresh_interval_ms = stored.gui.preview_refresh_interval_ms
+        self.section_expanded = stored.gui.section_expanded
+        self.collapsible_sections: dict[str, CollapsibleSection] = {}
         self.last_output_directory: Path | None = None
         self._thread: QThread | None = None
         self._worker: QObject | None = None
@@ -220,8 +230,8 @@ class IMSFigureExporterWindow(QMainWindow):
         left_panel = QWidget()
         self.left_layout = QVBoxLayout(left_panel)
         self.left_layout.setContentsMargins(4, 4, 4, 4)
-        batch_group = QGroupBox("Batch Files")
-        batch_layout = QVBoxLayout(batch_group)
+        batch_group = self._create_collapsible_section("batch_files", "Batch Files")
+        batch_layout = QVBoxLayout()
         self.batch_tree = QTreeWidget()
         self.batch_tree.setColumnCount(3)
         self.batch_tree.setHeaderLabels(["IMS file", "Process", "Export"])
@@ -233,9 +243,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self.batch_tree.itemSelectionChanged.connect(self._batch_selection_changed)
         self.batch_tree.itemChanged.connect(self._batch_item_changed)
         batch_layout.addWidget(self.batch_tree)
+        batch_group.set_content_layout(batch_layout)
         self.left_layout.addWidget(batch_group)
-        self.channels_group = QGroupBox("Channels")
-        self.channels_layout = QVBoxLayout(self.channels_group)
+        self.channels_group = self._create_collapsible_section("channels", "Channels")
+        self.channels_layout = QVBoxLayout()
+        self.channels_group.set_content_layout(self.channels_layout)
         self.left_layout.addWidget(self.channels_group)
         self._build_settings_groups()
         self.left_layout.addStretch(1)
@@ -316,9 +328,17 @@ class IMSFigureExporterWindow(QMainWindow):
         bottom.addWidget(self.export_button)
         root.addLayout(bottom)
 
+    def _create_collapsible_section(self, key: str, title: str) -> CollapsibleSection:
+        section = CollapsibleSection(title, self.section_expanded.get(key, True))
+        section.expanded_changed.connect(
+            lambda expanded, section_key=key: self.settings_store.save_section_expanded(section_key, expanded)
+        )
+        self.collapsible_sections[key] = section
+        return section
+
     def _build_settings_groups(self) -> None:
-        z_group = QGroupBox("Z Range")
-        z_form = QFormLayout(z_group)
+        z_group = self._create_collapsible_section("z_range", "Z Range")
+        z_form = QFormLayout()
         self.z_start = QSpinBox()
         self.z_end = QSpinBox()
         self.z_start.valueChanged.connect(self._update_z_info)
@@ -330,10 +350,26 @@ class IMSFigureExporterWindow(QMainWindow):
         z_form.addRow("Start (slice):", self.z_start)
         z_form.addRow("End (slice):", self.z_end)
         z_form.addRow(self.z_info)
+        z_group.content_widget.setLayout(z_form)
         self.left_layout.addWidget(z_group)
 
-        scale_group = QGroupBox("Scale Bar")
-        scale_form = QFormLayout(scale_group)
+        objective_group = self._create_collapsible_section("objective", "Objective")
+        objective_form = QFormLayout()
+        self.objective_combo = QComboBox()
+        self.objective_combo.addItem("Auto", None)
+        for objective_key in FV1200_OBJECTIVES:
+            self.objective_combo.addItem(objective_key, objective_key)
+        self.objective_combo.addItem("Unknown", "Unknown")
+        self.objective_combo.currentIndexChanged.connect(self._objective_selection_changed)
+        self.objective_details = QLabel("Open a file first.")
+        self.objective_details.setWordWrap(True)
+        objective_form.addRow("Objective:", self.objective_combo)
+        objective_form.addRow(self.objective_details)
+        objective_group.content_widget.setLayout(objective_form)
+        self.left_layout.addWidget(objective_group)
+
+        scale_group = self._create_collapsible_section("scale_bar", "Scale Bar")
+        scale_form = QFormLayout()
         self.include_scale_bar = QCheckBox("Include scale bar")
         self.include_scale_bar.setChecked(True)
         self.include_scale_bar.toggled.connect(self._toggle_scale_controls)
@@ -367,6 +403,7 @@ class IMSFigureExporterWindow(QMainWindow):
         scale_form.addRow("Bar thickness:", self.scale_thickness)
         scale_form.addRow("Text size:", self.scale_font_size)
         scale_form.addRow(self.red_to_magenta)
+        scale_group.content_widget.setLayout(scale_form)
         self.left_layout.addWidget(scale_group)
 
     @Slot()
@@ -449,6 +486,7 @@ class IMSFigureExporterWindow(QMainWindow):
         first_item = self.batch_tree.topLevelItem(0)
         self.batch_tree.setCurrentItem(first_item)
         self.batch_tree.blockSignals(False)
+        self.objective_combo.setCurrentIndex(0)
         first_path = Path(str(first_item.data(0, Qt.ItemDataRole.UserRole)))
         self._activate_metadata(loaded[first_path])
         if errors:
@@ -475,6 +513,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self.z_start.setValue(1)
         self.z_end.setValue(metadata.size_z)
         self._update_z_info()
+        self._update_objective_display()
         self._update_export_enabled()
         self.refresh_preview_action.setEnabled(True)
         self.status_label.setText(f"{len(self.batch_metadata)} IMS file(s) loaded. Active: {metadata.source_path.name}")
@@ -546,29 +585,58 @@ class IMSFigureExporterWindow(QMainWindow):
             swatch.setFixedSize(18, 18)
             minimum = self._range_spinbox(channel.display_min, 0.0)
             maximum = self._range_spinbox(channel.display_max, 1.0)
+            gamma = self._gamma_spinbox(channel.display_gamma)
+            slider_minimum, slider_maximum = self._range_slider_bounds(channel.display_min, channel.display_max)
+            minimum_slider = self._parameter_slider()
+            maximum_slider = self._parameter_slider()
+            gamma_slider = self._parameter_slider()
+            self._bind_spinbox_and_slider(minimum, minimum_slider, slider_minimum, slider_maximum)
+            self._bind_spinbox_and_slider(maximum, maximum_slider, slider_minimum, slider_maximum)
+            self._bind_spinbox_and_slider(gamma, gamma_slider, 0.1, 5.0)
             include.toggled.connect(self._schedule_preview_refresh)
             minimum.valueChanged.connect(self._schedule_preview_refresh)
             maximum.valueChanged.connect(self._schedule_preview_refresh)
+            gamma.valueChanged.connect(self._schedule_preview_refresh)
             use_data_minmax: QCheckBox | None = None
-            source = "IMS ColorRange" if channel.display_range_source == "ims" else "Data min/max fallback"
+            range_source = "IMS Min/Max" if channel.display_range_source == "ims" else "Data min/max fallback"
+            gamma_source = "IMS Gamma" if channel.display_gamma_source == "ims" else "Default Gamma"
+            source = f"{range_source}; {gamma_source}"
             layout.addWidget(include, 0, 0, 1, 2)
             layout.addWidget(swatch, 0, 2)
             layout.addWidget(QLabel("Min"), 1, 0)
             layout.addWidget(minimum, 1, 1)
+            layout.addWidget(minimum_slider, 1, 2)
             layout.addWidget(QLabel("Max"), 2, 0)
             layout.addWidget(maximum, 2, 1)
-            layout.addWidget(QLabel(source), 3, 0, 1, 3)
+            layout.addWidget(maximum_slider, 2, 2)
+            layout.addWidget(QLabel("Gamma"), 3, 0)
+            layout.addWidget(gamma, 3, 1)
+            layout.addWidget(gamma_slider, 3, 2)
+            layout.addWidget(QLabel(source), 4, 0, 1, 3)
             if channel.display_range_source != "ims":
                 use_data_minmax = QCheckBox("Use selected data min/max")
                 use_data_minmax.setChecked(True)
                 minimum.setEnabled(False)
                 maximum.setEnabled(False)
+                minimum_slider.setEnabled(False)
+                maximum_slider.setEnabled(False)
                 use_data_minmax.toggled.connect(minimum.setDisabled)
                 use_data_minmax.toggled.connect(maximum.setDisabled)
+                use_data_minmax.toggled.connect(minimum_slider.setDisabled)
+                use_data_minmax.toggled.connect(maximum_slider.setDisabled)
                 use_data_minmax.toggled.connect(self._schedule_preview_refresh)
-                layout.addWidget(use_data_minmax, 4, 0, 1, 3)
+                layout.addWidget(use_data_minmax, 5, 0, 1, 3)
             self.channels_layout.addWidget(row)
-            self.channel_controls[channel.index] = ChannelControls(include, minimum, maximum, use_data_minmax)
+            self.channel_controls[channel.index] = ChannelControls(
+                include,
+                minimum,
+                maximum,
+                gamma,
+                minimum_slider,
+                maximum_slider,
+                gamma_slider,
+                use_data_minmax,
+            )
         self._populate_preview_choices()
 
     @staticmethod
@@ -578,6 +646,55 @@ class IMSFigureExporterWindow(QMainWindow):
         spinbox.setRange(-1_000_000_000_000.0, 1_000_000_000_000.0)
         spinbox.setValue(value if value is not None else fallback)
         return spinbox
+
+    @staticmethod
+    def _gamma_spinbox(value: float) -> QDoubleSpinBox:
+        spinbox = QDoubleSpinBox()
+        spinbox.setDecimals(3)
+        spinbox.setRange(0.1, 5.0)
+        spinbox.setSingleStep(0.05)
+        spinbox.setValue(value)
+        return spinbox
+
+    @staticmethod
+    def _parameter_slider() -> QSlider:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 10_000)
+        slider.setMinimumWidth(120)
+        return slider
+
+    @staticmethod
+    def _range_slider_bounds(display_min: float | None, display_max: float | None) -> tuple[float, float]:
+        minimum = display_min if display_min is not None else 0.0
+        maximum = display_max if display_max is not None else max(minimum + 1.0, 1.0)
+        span = max(maximum - minimum, 1.0)
+        lower = min(0.0, minimum - span * 0.1)
+        upper = max(maximum + span * 0.1, lower + 1.0)
+        return lower, upper
+
+    @staticmethod
+    def _bind_spinbox_and_slider(
+        spinbox: QDoubleSpinBox,
+        slider: QSlider,
+        lower: float,
+        upper: float,
+    ) -> None:
+        steps = slider.maximum() - slider.minimum()
+
+        def update_spinbox(position: int) -> None:
+            fraction = (position - slider.minimum()) / steps
+            spinbox.setValue(lower + fraction * (upper - lower))
+
+        def update_slider(value: float) -> None:
+            fraction = (value - lower) / (upper - lower)
+            position = round(slider.minimum() + min(max(fraction, 0.0), 1.0) * steps)
+            slider.blockSignals(True)
+            slider.setValue(position)
+            slider.blockSignals(False)
+
+        slider.valueChanged.connect(update_spinbox)
+        spinbox.valueChanged.connect(update_slider)
+        update_slider(spinbox.value())
 
     def _populate_preview_choices(self) -> None:
         current = self.preview_combo.currentData()
@@ -618,6 +735,41 @@ class IMSFigureExporterWindow(QMainWindow):
         self.scale_thickness.setEnabled(included)
         self.scale_font_size.setEnabled(included)
 
+    @Slot()
+    def _objective_selection_changed(self) -> None:
+        self._update_objective_display()
+
+    def _update_objective_display(self) -> None:
+        if self.metadata is None:
+            self.objective_details.setText("Open a file first.")
+            return
+        detected = self.metadata.objective_detection or detect_objective(self.metadata)
+        override = self.objective_combo.currentData()
+        selected = apply_manual_objective(detected, str(override) if override is not None else None)
+
+        detected_text = (
+            f"{detected.objective_key} — {detected.model}" if detected.objective_key is not None else "Unknown"
+        )
+        selected_text = (
+            f"{selected.objective_key} — {selected.model}" if selected.objective_key is not None else "Unknown"
+        )
+        z_spacing = f"{selected.measured_z_spacing_um:.6g} µm" if selected.measured_z_spacing_um is not None else "N/A"
+        na = f"{selected.na:.2f}" if selected.na is not None else "N/A"
+        immersion = selected.immersion or "N/A"
+        warning = f"\nWarning: {selected.warning}" if selected.warning else ""
+        detection_text = (
+            "Manual selection"
+            if selected.detection_source == "Manual"
+            else f"{selected.detection_source} · {selected.confidence} confidence"
+        )
+        self.objective_details.setText(
+            f"Detected: {detected_text}\n"
+            f"Selected: {selected_text}\n"
+            f"NA: {na} · Immersion: {immersion}\n"
+            f"Z spacing: {z_spacing}\n"
+            f"Detection: {detection_text}{warning}"
+        )
+
     def _current_settings(self, show_warnings: bool = True) -> ExportSettings | None:
         if self.metadata is None:
             return None
@@ -629,12 +781,10 @@ class IMSFigureExporterWindow(QMainWindow):
             else:
                 self.status_label.setText(message)
             return None
-        ranges = self._display_ranges()
+        adjustments = self._display_adjustments()
         for index in channels:
-            if index not in ranges:
-                continue
-            minimum, maximum = ranges[index]
-            if maximum <= minimum:
+            display_range = adjustments[index].display_range
+            if display_range is not None and display_range[1] <= display_range[0]:
                 message = f"Channel {index}: Max must be greater than Min."
                 if show_warnings:
                     QMessageBox.warning(self, "Invalid display range", message)
@@ -645,6 +795,9 @@ class IMSFigureExporterWindow(QMainWindow):
             z_start=self.z_start.value(),
             z_end=self.z_end.value(),
             channel_indices=channels,
+            objective_override=(
+                str(self.objective_combo.currentData()) if self.objective_combo.currentData() is not None else None
+            ),
             red_to_magenta=self.red_to_magenta.isChecked(),
             scale_bar=ScaleBarSettings(
                 enabled=self.include_scale_bar.isChecked(),
@@ -661,29 +814,34 @@ class IMSFigureExporterWindow(QMainWindow):
             ),
         )
 
-    def _display_ranges(self) -> dict[int, tuple[float, float]]:
-        return {
-            index: (controls.minimum.value(), controls.maximum.value())
-            for index, controls in self.channel_controls.items()
-            if controls.use_data_minmax is None or not controls.use_data_minmax.isChecked()
-        }
+    def _display_adjustments(self) -> dict[int, DisplayAdjustmentSettings]:
+        adjustments: dict[int, DisplayAdjustmentSettings] = {}
+        for index, controls in self.channel_controls.items():
+            use_fallback = controls.use_data_minmax is not None and controls.use_data_minmax.isChecked()
+            adjustments[index] = DisplayAdjustmentSettings(
+                display_min=None if use_fallback else controls.minimum.value(),
+                display_max=None if use_fallback else controls.maximum.value(),
+                gamma=controls.gamma.value(),
+            )
+        return adjustments
 
     def _channel_selections(self) -> tuple[ChannelSelection, ...]:
         if self.metadata is None:
             return ()
-        display_ranges = self._display_ranges()
+        display_adjustments = self._display_adjustments()
         selections: list[ChannelSelection] = []
         for channel in self.metadata.channels:
             controls = self.channel_controls[channel.index]
             if not controls.include.isChecked():
                 continue
-            display_range = display_ranges.get(channel.index)
+            display_adjustment = display_adjustments[channel.index]
             selections.append(
                 ChannelSelection(
                     index=channel.index,
                     name=channel.name,
-                    display_min=display_range[0] if display_range else None,
-                    display_max=display_range[1] if display_range else None,
+                    display_min=display_adjustment.display_min,
+                    display_max=display_adjustment.display_max,
+                    gamma=display_adjustment.gamma,
                 )
             )
         return tuple(selections)
@@ -710,7 +868,7 @@ class IMSFigureExporterWindow(QMainWindow):
             else:
                 self.status_label.setText(message)
             return
-        worker = PreviewWorker(self.metadata.source_path, settings, self._display_ranges(), selected_preview)
+        worker = PreviewWorker(self.metadata.source_path, settings, self._display_adjustments(), selected_preview)
         self._run_worker(worker, self._preview_finished)
 
     def _schedule_preview_refresh(self, *_: object) -> None:
@@ -868,6 +1026,7 @@ class IMSFigureExporterWindow(QMainWindow):
         batch_outcome: BatchExportOutcome = outcome  # type: ignore[assignment]
         result_list = list(batch_outcome.results)
         info_paths = list(batch_outcome.info_paths)
+        summary_paths = list(batch_outcome.summary_paths)
         if info_paths:
             self.last_output_directory = info_paths[-1].parent
             self.open_folder_button.setEnabled(True)
@@ -892,12 +1051,19 @@ class IMSFigureExporterWindow(QMainWindow):
         warning_text = (
             "\n\nCompatibility adjustments:\n" + "\n".join(batch_outcome.warnings) if batch_outcome.warnings else ""
         )
+        if len(summary_paths) == 1:
+            summary_text = "\n\nPPT summary:\n" + summary_paths[0].read_text(encoding="utf-8")
+        elif summary_paths:
+            summary_text = f"\n\nPPT summaries: {len(summary_paths)} text files"
+        else:
+            summary_text = ""
         QMessageBox.information(
             self,
             status_prefix,
             f"{len(result_list)} image files from {len(info_paths)} IMS file(s) were created."
             f"{clipboard_note}\n\nOutput folder(s):\n{output_text}"
-            f"\n\nExport records: {len(info_paths)}{warning_text}{error_text}",
+            f"\n\nExport records: {len(info_paths)}"
+            f"\nPPT summary files: {len(summary_paths)}{summary_text}{warning_text}{error_text}",
         )
 
     @staticmethod

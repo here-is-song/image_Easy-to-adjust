@@ -19,9 +19,10 @@ from .exporter import (
     render_merge,
     render_single_channel,
     write_export_info,
+    write_ppt_summary,
 )
 from .ims_reader import IMSReader, IMSReaderError
-from .models import ChannelSelection, ExportSettings
+from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings
 
 PREVIEW_MAX_EDGE = 1200
 
@@ -30,6 +31,7 @@ PREVIEW_MAX_EDGE = 1200
 class BatchExportOutcome:
     results: tuple[ExportResult, ...]
     info_paths: tuple[Path, ...]
+    summary_paths: tuple[Path, ...]
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
     cancelled: bool = False
@@ -53,13 +55,13 @@ class PreviewWorker(QObject):
         self,
         source_path: Path,
         settings: ExportSettings,
-        display_ranges: Mapping[int, tuple[float, float]],
+        display_adjustments: Mapping[int, DisplayAdjustmentSettings],
         preview_channel: int | None,
     ) -> None:
         super().__init__()
         self.source_path = source_path
         self.settings = settings
-        self.display_ranges = dict(display_ranges)
+        self.display_adjustments = dict(display_adjustments)
         self.preview_channel = preview_channel
 
     @Slot()
@@ -69,13 +71,13 @@ class PreviewWorker(QObject):
                 if reader.metadata is None:
                     raise IMSReaderError("IMS metadata could not be read.")
                 if self.preview_channel is None:
-                    image, _ = render_merge(reader, self.settings, self.display_ranges)
+                    image, _ = render_merge(reader, self.settings, self.display_adjustments)
                 else:
                     image, _ = render_single_channel(
                         reader,
                         self.settings,
                         self.preview_channel,
-                        self.display_ranges.get(self.preview_channel),
+                        self.display_adjustments.get(self.preview_channel),
                     )
                 output_image, _ = prepare_output_image(image, reader, self.settings)
                 self.finished.emit(_downsample_for_preview(output_image))
@@ -111,6 +113,7 @@ class ExportWorker(QObject):
     def run(self) -> None:
         all_results: list[ExportResult] = []
         info_paths: list[Path] = []
+        summary_paths: list[Path] = []
         errors: list[str] = []
         warnings: list[str] = []
         total = len(self.source_paths)
@@ -130,11 +133,13 @@ class ExportWorker(QObject):
                         reader,
                         matched.settings,
                         self.output_directory,
-                        display_ranges=matched.display_ranges,
+                        display_adjustments=matched.display_adjustments,
                     )
                     info_path = write_export_info(reader, matched.settings, results, self.output_directory)
+                    summary_path = write_ppt_summary(reader, matched.settings, self.output_directory)
                     all_results.extend(results)
                     info_paths.append(info_path)
+                    summary_paths.append(summary_path)
             except Exception as exc:  # Continue with other files in the batch.
                 errors.append(f"{source_path.name}: {exc}")
         cancelled = self._cancel_event.is_set()
@@ -144,10 +149,11 @@ class ExportWorker(QObject):
             return
         self.finished.emit(
             BatchExportOutcome(
-                tuple(all_results),
-                tuple(info_paths),
-                tuple(errors),
-                tuple(warnings),
-                cancelled,
+                results=tuple(all_results),
+                info_paths=tuple(info_paths),
+                summary_paths=tuple(summary_paths),
+                errors=tuple(errors),
+                warnings=tuple(warnings),
+                cancelled=cancelled,
             )
         )

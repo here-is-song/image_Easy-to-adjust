@@ -15,7 +15,14 @@ from PIL import Image, ImageOps
 from .color_mapping import additive_merge, apply_pseudocolor, convert_red_to_magenta
 from .display_adjustment import apply_display_adjustment, resolve_display_range
 from .ims_reader import IMSReader, IMSReaderError
-from .models import ChannelMetadata, ExportSettings
+from .models import (
+    ChannelMetadata,
+    DisplayAdjustmentSettings,
+    ExportSettings,
+    IMSMetadata,
+    ObjectiveDetectionResult,
+)
+from .objective_detector import apply_manual_objective, detect_objective
 from .scalebar import draw_scale_bar
 
 
@@ -38,6 +45,7 @@ class ChannelExportRecord:
     name: str
     display_min: float
     display_max: float
+    gamma: float
     original_color: tuple[float, float, float]
     output_color: tuple[float, float, float]
 
@@ -98,23 +106,29 @@ def _project_and_adjust(
     channel: ChannelMetadata,
     z_start: int,
     z_end: int,
-    display_range: tuple[float, float] | None = None,
-) -> tuple[np.ndarray, float, float]:
+    display_adjustment: DisplayAdjustmentSettings | None = None,
+) -> tuple[np.ndarray, float, float, float]:
     # Scientific order: raw intensity -> chunked Z projection -> display adjustment.
     projection, data_min, data_max = reader.project_z_range(channel.index, z_start, z_end)
+    display_range = display_adjustment.display_range if display_adjustment is not None else None
     display_min, display_max = display_range or resolve_display_range(
         channel.display_min,
         channel.display_max,
         np.asarray([data_min, data_max]),
     )
-    return apply_display_adjustment(projection, display_min, display_max), display_min, display_max
+    gamma = (
+        display_adjustment.gamma
+        if display_adjustment is not None and display_adjustment.gamma is not None
+        else channel.display_gamma
+    )
+    return apply_display_adjustment(projection, display_min, display_max, gamma), display_min, display_max, gamma
 
 
 def render_single_channel(
     reader: IMSReader,
     settings: ExportSettings,
     channel_index: int,
-    display_range: tuple[float, float] | None = None,
+    display_adjustment: DisplayAdjustmentSettings | None = None,
 ) -> tuple[np.ndarray, ChannelExportRecord]:
     """Create an 8-bit grayscale MIP without writing a file."""
 
@@ -124,14 +138,15 @@ def render_single_channel(
     if not 0 <= channel_index < metadata.channel_count:
         raise IMSReaderError(f"Channel index {channel_index} is out of range.")
     channel = metadata.channels[channel_index]
-    image, display_min, display_max = _project_and_adjust(
-        reader, channel, settings.z_start, settings.z_end, display_range
+    image, display_min, display_max, gamma = _project_and_adjust(
+        reader, channel, settings.z_start, settings.z_end, display_adjustment
     )
     record = ChannelExportRecord(
         index=channel.index,
         name=channel.name,
         display_min=display_min,
         display_max=display_max,
+        gamma=gamma,
         original_color=channel.color,
         output_color=channel.color,
     )
@@ -141,7 +156,7 @@ def render_single_channel(
 def render_merge(
     reader: IMSReader,
     settings: ExportSettings,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> tuple[np.ndarray, tuple[ChannelExportRecord, ...]]:
     """Create an additive RGB MIP without writing a file."""
 
@@ -150,20 +165,20 @@ def render_merge(
         raise IMSReaderError("Open the IMS file before rendering.")
     if not settings.channel_indices:
         raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_ranges)
+    rendered = render_selected_channels(reader, settings, display_adjustments)
     return merge_rendered_channels(rendered, settings)
 
 
 def render_selected_channels(
     reader: IMSReader,
     settings: ExportSettings,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> dict[int, tuple[np.ndarray, ChannelExportRecord]]:
     """Render every selected grayscale channel once for reuse by all outputs."""
 
-    range_overrides = display_ranges or {}
+    adjustment_overrides = display_adjustments or {}
     return {
-        channel_index: render_single_channel(reader, settings, channel_index, range_overrides.get(channel_index))
+        channel_index: render_single_channel(reader, settings, channel_index, adjustment_overrides.get(channel_index))
         for channel_index in settings.channel_indices
     }
 
@@ -186,6 +201,7 @@ def merge_rendered_channels(
                 name=record.name,
                 display_min=record.display_min,
                 display_max=record.display_max,
+                gamma=record.gamma,
                 original_color=record.original_color,
                 output_color=output_color,
             )
@@ -209,6 +225,18 @@ def _export_rendered_single_channels(
     results: list[ExportResult] = []
     for channel_index in settings.channel_indices:
         adjusted, record = rendered[channel_index]
+        if output_format == "png":
+            output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
+            adjusted = additive_merge([apply_pseudocolor(adjusted, output_color)])
+            record = ChannelExportRecord(
+                index=record.index,
+                name=record.name,
+                display_min=record.display_min,
+                display_max=record.display_max,
+                gamma=record.gamma,
+                original_color=record.original_color,
+                output_color=output_color,
+            )
         output_image, chosen_scale = prepare_output_image(adjusted, reader, settings)
         filename = f"{source_name}_{sanitize_filename_component(record.name)}.{output_format}"
         output_path = _available_path(output_dir / filename)
@@ -324,13 +352,13 @@ def export_single_channels(
     reader: IMSReader,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> list[ExportResult]:
-    """Export selected channels as independent 8-bit grayscale images."""
+    """Export channels as grayscale TIFF or RGB pseudocolor PNG images."""
 
     if not settings.channel_indices:
         raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_ranges)
+    rendered = render_selected_channels(reader, settings, display_adjustments)
     return _export_rendered_single_channels(reader, settings, rendered, output_directory)
 
 
@@ -338,11 +366,11 @@ def export_merge(
     reader: IMSReader,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> ExportResult:
     """Export selected channels as an additive, 8-bit RGB pseudocolor image."""
 
-    rendered = render_selected_channels(reader, settings, display_ranges)
+    rendered = render_selected_channels(reader, settings, display_adjustments)
     return _export_rendered_merge(reader, settings, rendered, output_directory)
 
 
@@ -350,13 +378,13 @@ def export_channels_and_merge(
     reader: IMSReader,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
-    display_ranges: Mapping[int, tuple[float, float]] | None = None,
+    display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> list[ExportResult]:
-    """Export grayscale channels and a merge while projecting each channel once."""
+    """Export individual channels and a merge while projecting each channel once."""
 
     if not settings.channel_indices:
         raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_ranges)
+    rendered = render_selected_channels(reader, settings, display_adjustments)
     results = _export_rendered_single_channels(reader, settings, rendered, output_directory)
     results.append(_export_rendered_merge(reader, settings, rendered, output_directory))
     return results
@@ -388,11 +416,14 @@ def write_export_info(
             "name": record.name,
             "display_min": record.display_min,
             "display_max": record.display_max,
+            "gamma": record.gamma,
             "original_color": list(record.original_color),
             "output_color": list(record.output_color),
         }
         for record in channel_records
     ]
+    detected_objective = metadata.objective_detection or detect_objective(metadata)
+    selected_objective = apply_manual_objective(detected_objective, settings.objective_override)
     payload = {
         "source_file": metadata.source_path.name,
         "source_path": str(metadata.source_path),
@@ -411,9 +442,109 @@ def write_export_info(
         "output_height_px": settings.output.height_px,
         "output_dpi": settings.output.dpi,
         "resize_mode": settings.output.resize_mode,
+        "acquisition": {
+            "recording_date": (
+                metadata.acquisition.recording_date.isoformat()
+                if metadata.acquisition.recording_date is not None
+                else None
+            ),
+            "microscope_manufacturer": metadata.acquisition.microscope_manufacturer,
+            "microscope_model": metadata.acquisition.microscope_model,
+            "scan_speed_us_per_pixel": metadata.acquisition.scan_speed_us_per_pixel,
+            "objective_name": metadata.acquisition.objective_name,
+            "objective_magnification": metadata.acquisition.objective_magnification,
+            "numerical_aperture": metadata.acquisition.numerical_aperture,
+            "z_section_interval_um": metadata.acquisition.z_section_interval_um,
+            "scan_zoom": metadata.acquisition.scan_zoom,
+        },
+        "objective_detection": _objective_result_payload(detected_objective),
+        "selected_objective": _objective_result_payload(selected_objective),
         "channels": channel_info,
         "output_files": [str(result.path) for result in results],
     }
     output_path = _available_path(output_dir / "export_info.json")
     output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path
+
+
+def _summary_number(value: float) -> str:
+    return f"{value:.6g}"
+
+
+def _objective_result_payload(objective: ObjectiveDetectionResult) -> dict[str, object]:
+    return {
+        "objective_key": objective.objective_key,
+        "model": objective.model,
+        "magnification": objective.magnification,
+        "na": objective.na,
+        "immersion": objective.immersion,
+        "measured_z_spacing_um": objective.measured_z_spacing_um,
+        "expected_z_spacing_um": objective.expected_z_spacing_um,
+        "relative_error": objective.relative_error,
+        "confidence": objective.confidence,
+        "detection_source": objective.detection_source,
+        "warning": objective.warning,
+    }
+
+
+def _summary_microscope(metadata: IMSMetadata) -> str:
+    manufacturer = metadata.acquisition.microscope_manufacturer
+    model = metadata.acquisition.microscope_model
+    if manufacturer and model:
+        if manufacturer.casefold() in model.casefold():
+            return model
+        return f"{manufacturer} {model}"
+    return manufacturer or model or "Not available"
+
+
+def _summary_objective(metadata: IMSMetadata, settings: ExportSettings) -> str:
+    detected = metadata.objective_detection or detect_objective(metadata)
+    selected = apply_manual_objective(detected, settings.objective_override)
+    if selected.objective_key is None:
+        return "Not available"
+    objective = selected.model or selected.objective_key
+    if selected.na is not None:
+        objective += f" (N.A.{selected.na:.2f})"
+    return objective
+
+
+def format_ppt_summary(metadata: IMSMetadata, settings: ExportSettings) -> str:
+    """Format source acquisition details as four copy-ready lines for a PPT."""
+
+    acquisition = metadata.acquisition
+    detected = metadata.objective_detection or detect_objective(metadata)
+    selected = apply_manual_objective(detected, settings.objective_override)
+    date = acquisition.recording_date.strftime("%y%m%d") if acquisition.recording_date is not None else "Not available"
+    scan_speed = (
+        f"{_summary_number(acquisition.scan_speed_us_per_pixel)} μsecond/pixel"
+        if acquisition.scan_speed_us_per_pixel is not None
+        else "Not available"
+    )
+    selected_thickness = (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um
+    z_interval = selected.measured_z_spacing_um or metadata.voxel_size_z_um
+    return (
+        f"Date: {date}\n"
+        f"Microscope: {_summary_microscope(metadata)}\n"
+        f"Scan speed: {scan_speed}, Size: {metadata.size_x}×{metadata.size_y}\n"
+        f"Objective lens: {_summary_objective(metadata, settings)}, "
+        f"Z-sectioning interval: {_summary_number(z_interval)} μm, "
+        f"Z-stack thickness: {_summary_number(selected_thickness)} μm;"
+    )
+
+
+def write_ppt_summary(
+    reader: IMSReader,
+    settings: ExportSettings,
+    output_directory: str | Path | None = None,
+) -> Path:
+    """Write one copy-ready microscopy acquisition summary beside exported images."""
+
+    metadata = reader.metadata
+    if metadata is None:
+        raise IMSReaderError("Open the IMS file before writing a PPT summary.")
+    output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_name = sanitize_filename_component(metadata.source_path.stem)
+    output_path = _available_path(output_dir / f"{source_name}_PPT_summary.txt")
+    output_path.write_text(format_ppt_summary(metadata, settings), encoding="utf-8")
     return output_path

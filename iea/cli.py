@@ -11,6 +11,7 @@ from .exporter import (
     export_merge,
     export_single_channels,
     write_export_info,
+    write_ppt_summary,
 )
 from .ims_reader import IMSReader, IMSReaderError
 from .models import (
@@ -34,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         action="append",
         dest="channels",
-        help="0-based channel index to export as grayscale; repeat to select multiple channels",
+        help="0-based channel index to export independently; repeat to select multiple channels",
     )
     parser.add_argument(
         "--merge",
@@ -90,6 +91,14 @@ def print_metadata(metadata: IMSMetadata) -> None:
     )
     print(f"Data type: {metadata.dtype}")
     print(f"Time points: {metadata.time_point_count} (TimePoint 0 is used)")
+    objective = metadata.objective_detection
+    if objective is not None and objective.objective_key is not None:
+        print(f"Objective: {objective.objective_key} — {objective.model}")
+        print(f"Objective detection: {objective.detection_source}, {objective.confidence} confidence")
+    else:
+        print("Objective: Unknown (manual selection required)")
+    if objective is not None and objective.warning:
+        print(f"Objective warning: {objective.warning}", file=sys.stderr)
     print(f"Channels: {metadata.channel_count}")
     for channel in metadata.channels:
         display_range = (
@@ -101,6 +110,7 @@ def print_metadata(metadata: IMSMetadata) -> None:
         print(f"  [{channel.index}] {channel.name}")
         print(f"      Color: ({color})")
         print(f"      ColorRange: {display_range}")
+        print(f"      GammaCorrection: {channel.display_gamma:.6g}")
         print(f"      Dataset axes: {', '.join(channel.axis_order)}")
     for warning in metadata.warnings:
         print(f"Warning: {warning}", file=sys.stderr)
@@ -154,11 +164,15 @@ def run(argv: list[str] | None = None) -> int:
             elif args.merge:
                 results.append(export_merge(reader, settings, args.output_dir))
             info_path = write_export_info(reader, settings, results, args.output_dir)
+            summary_path = write_ppt_summary(reader, settings, args.output_dir)
             print("\nExport completed:")
             for result in results:
                 scale = f", scale bar {result.scale_bar_um:g} um" if result.scale_bar_um else ""
                 print(f"  {result.path} — shape {result.shape}, dtype {result.dtype}{scale}")
             print(f"  {info_path} - export settings record")
+            print(f"  {summary_path} - PPT acquisition summary")
+            print("\nPPT summary:")
+            print(summary_path.read_text(encoding="utf-8"))
             return 0
     except (IMSReaderError, OSError, ValueError) as exc:
         print("Unable to process IMS file.", file=sys.stderr)

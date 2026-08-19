@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import itertools
 import re
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +19,8 @@ from .metadata import (
     parse_number_list,
     unit_scale_to_um,
 )
-from .models import ChannelMetadata, IMSMetadata
+from .models import AcquisitionMetadata, ChannelMetadata, IMSMetadata
+from .objective_detector import detect_objective
 
 
 class IMSReaderError(RuntimeError):
@@ -175,7 +178,8 @@ class IMSReader:
             channels.append(self._parse_channel(index, channel_info, data, channel_axis_order, warnings))
 
         size_x, size_y, size_z = sizes["X"], sizes["Y"], sizes["Z"]
-        return IMSMetadata(
+        acquisition = self._parse_acquisition_metadata(image_info, dataset_info)
+        metadata = IMSMetadata(
             source_path=self.path.resolve(),
             size_x=size_x,
             size_y=size_y,
@@ -193,7 +197,18 @@ class IMSReader:
             dtype=str(first_data.dtype),
             time_point_count=len(time_points),
             channels=tuple(channels),
+            acquisition=acquisition,
             warnings=tuple(warnings),
+        )
+        return replace(
+            metadata,
+            objective_detection=detect_objective(
+                metadata,
+                pixel_size_x_um=metadata.voxel_size_x_um,
+                pixel_size_y_um=metadata.voxel_size_y_um,
+                image_width_px=metadata.size_x,
+                image_height_px=metadata.size_y,
+            ),
         )
 
     @staticmethod
@@ -203,6 +218,123 @@ class IMSReader:
             return None, None
         image_info = _child_casefold(dataset_info, "Image")
         return (image_info if isinstance(image_info, h5py.Group) else None), dataset_info
+
+    @staticmethod
+    def _parse_acquisition_metadata(
+        image_info: h5py.Group | None,
+        dataset_info: h5py.Group | None,
+    ) -> AcquisitionMetadata:
+        image_attrs = image_info.attrs if image_info is not None else {}
+        recording_date = IMSReader._parse_recording_date(
+            get_attribute(image_attrs, "RecordingDate", "AcquisitionDate", "ImageCaptureDate")
+        )
+        manufacturer = IMSReader._known_metadata_text(
+            get_attribute(image_attrs, "ManufactorString", "Manufacturer", "MicroscopeManufacturer")
+        )
+        model = IMSReader._known_metadata_text(
+            get_attribute(image_attrs, "ManufactorModel", "ManufacturerModel", "MicroscopeModel")
+        )
+        objective_name = IMSReader._known_metadata_text(
+            IMSReader._find_metadata_attribute(
+                dataset_info,
+                "ObjectiveName",
+                "ObjectiveLens",
+                "ObjectiveModel",
+                "LensName",
+                "Lens",
+                "Objective",
+            )
+        )
+        lens_power = IMSReader._positive_metadata_number(
+            get_attribute(image_attrs, "LensPower", "ObjectiveMagnification", "Magnification")
+        )
+        numerical_aperture = IMSReader._positive_metadata_number(
+            get_attribute(image_attrs, "NumericalAperture", "ObjectiveNA", "LensNA")
+        )
+        sampling_clock = IMSReader._positive_metadata_number(
+            IMSReader._find_metadata_attribute(dataset_info, "SamplingClock")
+        )
+        scan_speed = 1_000_000.0 / sampling_clock if sampling_clock is not None else None
+        z_section_interval = IMSReader._parse_z_section_interval(dataset_info)
+        scan_zoom = IMSReader._positive_metadata_number(
+            IMSReader._find_metadata_attribute(dataset_info, "ScanZoom", "ZoomValue", "Zoom")
+        )
+        return AcquisitionMetadata(
+            recording_date=recording_date,
+            microscope_manufacturer=manufacturer,
+            microscope_model=model,
+            scan_speed_us_per_pixel=scan_speed,
+            objective_name=objective_name,
+            objective_magnification=lens_power,
+            numerical_aperture=numerical_aperture,
+            z_section_interval_um=z_section_interval,
+            scan_zoom=scan_zoom,
+        )
+
+    @staticmethod
+    def _parse_z_section_interval(dataset_info: h5py.Group | None) -> float | None:
+        if dataset_info is None:
+            return None
+        for child in dataset_info.values():
+            if not isinstance(child, h5py.Group):
+                continue
+            axis_code = IMSReader._known_metadata_text(get_attribute(child.attrs, "AxisCode", "AxisName"))
+            if axis_code is None or axis_code.casefold() != "z":
+                continue
+            interval = IMSReader._positive_metadata_number(get_attribute(child.attrs, "Interval", "StepSize", "ZStep"))
+            if interval is None:
+                continue
+            unit = IMSReader._known_metadata_text(get_attribute(child.attrs, "PixUnit", "UnitName", "Unit"))
+            factor = unit_scale_to_um(unit) if unit is not None else None
+            if factor is not None:
+                return interval * factor
+        return None
+
+    @staticmethod
+    def _find_metadata_attribute(dataset_info: h5py.Group | None, *names: str) -> Any | None:
+        if dataset_info is None:
+            return None
+        direct = get_attribute(dataset_info.attrs, *names)
+        if direct is not None:
+            return direct
+        for child in dataset_info.values():
+            if isinstance(child, h5py.Group):
+                value = get_attribute(child.attrs, *names)
+                if value is not None:
+                    return value
+        return None
+
+    @staticmethod
+    def _known_metadata_text(value: Any | None) -> str | None:
+        if value is None:
+            return None
+        text = str(normalize_attribute(value)).strip().strip("'\"")
+        if text.casefold() in {"", "not known", "unknown", "none", "n/a", "na"}:
+            return None
+        return text
+
+    @staticmethod
+    def _positive_metadata_number(value: Any | None) -> float | None:
+        numbers = parse_number_list(value)
+        if not numbers or not np.isfinite(numbers[0]) or numbers[0] <= 0:
+            return None
+        return float(numbers[0])
+
+    @staticmethod
+    def _parse_recording_date(value: Any | None) -> datetime | None:
+        text = IMSReader._known_metadata_text(value)
+        if text is None:
+            return None
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            pass
+        for date_format in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, date_format)
+            except ValueError:
+                continue
+        return None
 
     @staticmethod
     def _read_sizes(image_info: h5py.Group | None) -> dict[str, int] | None:
@@ -363,15 +495,26 @@ class IMSReader:
             source = "data_min_max"
             warnings.append(f"Display range not found for {name}; selected data min/max will be used during export.")
 
+        gamma_values = parse_number_list(get_attribute(attrs, "GammaCorrection", "Gamma"))
+        if gamma_values and np.isfinite(gamma_values[0]) and 0.1 <= gamma_values[0] <= 5.0:
+            display_gamma = float(gamma_values[0])
+            gamma_source = "ims"
+        else:
+            display_gamma = 1.0
+            gamma_source = "default"
+            warnings.append(f"Gamma correction not found for {name}; default gamma 1.0 will be used.")
+
         return ChannelMetadata(
             index=index,
             name=name,
             color=color,
             display_min=display_min,
             display_max=display_max,
+            display_gamma=display_gamma,
             dataset_path=data.name,
             axis_order=axis_order,
             display_range_source=source,
+            display_gamma_source=gamma_source,
         )
 
     def read_z_range(self, channel_index: int, z_start: int, z_end: int) -> np.ndarray:

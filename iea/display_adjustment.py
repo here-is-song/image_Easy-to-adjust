@@ -10,8 +10,9 @@ def apply_display_adjustment(
     image: ArrayLike,
     display_min: float,
     display_max: float,
+    gamma: float = 1.0,
 ) -> NDArray[np.uint8]:
-    """Linearly map an image to uint8 using an Imaris-style ColorRange.
+    """Map an image to uint8 using Imaris-style min, max, and gamma.
 
     The input is never modified. Values at or below ``display_min`` become 0,
     and values at or above ``display_max`` become 255.
@@ -21,9 +22,13 @@ def apply_display_adjustment(
         raise ValueError("Display range must contain finite numbers.")
     if display_max <= display_min:
         raise ValueError("display_max must be greater than display_min.")
+    if not np.isfinite(gamma) or not 0.1 <= gamma <= 5.0:
+        raise ValueError("Gamma must be between 0.1 and 5.0.")
     source = np.asarray(image)
     normalized = (source.astype(np.float32, copy=False) - display_min) / (display_max - display_min)
     normalized = np.clip(normalized, 0.0, 1.0)
+    if gamma != 1.0:
+        normalized = np.power(normalized, gamma)
     return np.rint(normalized * 255.0).astype(np.uint8)
 
 

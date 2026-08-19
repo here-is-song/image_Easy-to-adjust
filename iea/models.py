@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 
@@ -15,9 +16,58 @@ class ChannelMetadata:
     color: tuple[float, float, float]
     display_min: float | None
     display_max: float | None
+    display_gamma: float
     dataset_path: str
     axis_order: tuple[str, str, str]
     display_range_source: str = "ims"
+    display_gamma_source: str = "ims"
+
+
+@dataclass(frozen=True)
+class DisplayAdjustmentSettings:
+    """Min, max, and gamma values used to display one channel."""
+
+    display_min: float | None
+    display_max: float | None
+    gamma: float | None = None
+
+    @property
+    def display_range(self) -> tuple[float, float] | None:
+        if self.display_min is None or self.display_max is None:
+            return None
+        return self.display_min, self.display_max
+
+
+@dataclass(frozen=True)
+class AcquisitionMetadata:
+    """Optional acquisition details preserved by the source microscopy file."""
+
+    recording_date: datetime | None = None
+    microscope_manufacturer: str | None = None
+    microscope_model: str | None = None
+    scan_speed_us_per_pixel: float | None = None
+    objective_name: str | None = None
+    objective_magnification: float | None = None
+    numerical_aperture: float | None = None
+    z_section_interval_um: float | None = None
+    scan_zoom: float | None = None
+
+
+@dataclass(frozen=True)
+class ObjectiveDetectionResult:
+    """Traceable result from metadata, calibrated Z spacing, or manual selection."""
+
+    objective_key: str | None
+    model: str | None
+    magnification: float | None
+    na: float | None
+    immersion: str | None
+    measured_z_spacing_um: float | None
+    expected_z_spacing_um: float | None
+    relative_error: float | None
+    confidence: str
+    detection_source: str
+    warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +91,8 @@ class IMSMetadata:
     dtype: str
     time_point_count: int
     channels: tuple[ChannelMetadata, ...]
+    acquisition: AcquisitionMetadata = field(default_factory=AcquisitionMetadata)
+    objective_detection: ObjectiveDetectionResult | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -56,12 +108,17 @@ class ChannelSelection:
     name: str
     display_min: float | None = None
     display_max: float | None = None
+    gamma: float | None = None
 
     @property
     def display_range(self) -> tuple[float, float] | None:
         if self.display_min is None or self.display_max is None:
             return None
         return self.display_min, self.display_max
+
+    @property
+    def display_adjustment(self) -> DisplayAdjustmentSettings:
+        return DisplayAdjustmentSettings(self.display_min, self.display_max, self.gamma)
 
 
 @dataclass(frozen=True)
@@ -98,6 +155,7 @@ class ExportSettings:
     red_to_magenta: bool = True
     scale_bar: ScaleBarSettings = field(default_factory=ScaleBarSettings)
     output: ImageOutputSettings = field(default_factory=ImageOutputSettings)
+    objective_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,3 +165,4 @@ class GuiPreferences:
     output_directory: Path | None = None
     copy_to_clipboard: bool = False
     preview_refresh_interval_ms: int = 1000
+    section_expanded: dict[str, bool] = field(default_factory=dict)

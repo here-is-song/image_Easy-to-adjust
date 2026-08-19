@@ -49,6 +49,8 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     assert window.output_resize_mode == "fit"
     assert window.export_action.shortcut().toString() == "Ctrl+C"
     assert not window.export_button.isEnabled()
+    assert set(window.collapsible_sections) == {"batch_files", "channels", "z_range", "objective", "scale_bar"}
+    assert all(section.is_expanded for section in window.collapsible_sections.values())
     window.close()
     assert application is not None
 
@@ -74,13 +76,49 @@ def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui
     window = IMSFigureExporterWindow(gui_settings)
     window.metadata = metadata
     window._populate_channels(metadata)
+    green_controls = window.channel_controls[0]
+    assert green_controls.minimum.value() == 0.0
+    assert green_controls.maximum.value() == 20.0
+    assert green_controls.gamma.value() == 0.5
+    assert green_controls.minimum_slider.orientation() == Qt.Orientation.Horizontal
+    assert green_controls.maximum_slider.orientation() == Qt.Orientation.Horizontal
+    assert green_controls.gamma_slider.orientation() == Qt.Orientation.Horizontal
     window.refresh_limit_actions[2000].trigger()
-    window.scale_thickness.setValue(4)
+    green_controls.gamma_slider.setValue(green_controls.gamma_slider.maximum())
 
     assert window._preview_refresh_pending
     assert window._preview_timer.isActive()
     assert window._preview_timer.interval() == 2000
+    assert green_controls.gamma.value() == 5.0
+    assert window._display_adjustments()[0].gamma == 5.0
 
+    window._preview_timer.stop()
+    window.close()
+    assert application is not None
+
+
+def test_objective_auto_detection_and_manual_override_reach_export_settings(sample_ims, gui_settings):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+    window.z_start.setValue(1)
+    window.z_end.setValue(metadata.size_z)
+    window._update_objective_display()
+
+    assert "Detected: 10X — UPLSAPO10X" in window.objective_details.text()
+    assert "Metadata · High confidence" in window.objective_details.text()
+    window.objective_combo.setCurrentIndex(window.objective_combo.findData("60X"))
+    settings = window._current_settings()
+
+    assert "Selected: 60X — UPLSAPO60XS" in window.objective_details.text()
+    assert "Detection: Manual selection" in window.objective_details.text()
+    assert settings is not None
+    assert settings.objective_override == "60X"
     window._preview_timer.stop()
     window.close()
     assert application is not None
@@ -195,6 +233,30 @@ def test_menu_settings_persist_between_windows(tmp_path):
     assert application is not None
 
 
+def test_collapsible_section_states_persist_between_windows(tmp_path):
+    application = QApplication.instance() or QApplication([])
+    settings_path = tmp_path / "sections.ini"
+    first = IMSFigureExporterWindow(QSettings(str(settings_path), QSettings.Format.IniFormat))
+
+    first.collapsible_sections["channels"].header_button.click()
+    first.collapsible_sections["scale_bar"].header_button.click()
+
+    assert not first.collapsible_sections["channels"].is_expanded
+    assert first.collapsible_sections["channels"].content_widget.isHidden()
+    assert not first.collapsible_sections["scale_bar"].is_expanded
+    assert first.collapsible_sections["batch_files"].is_expanded
+    first.close()
+
+    second = IMSFigureExporterWindow(QSettings(str(settings_path), QSettings.Format.IniFormat))
+    assert not second.collapsible_sections["channels"].is_expanded
+    assert second.collapsible_sections["channels"].content_widget.isHidden()
+    assert not second.collapsible_sections["scale_bar"].is_expanded
+    assert second.collapsible_sections["batch_files"].is_expanded
+    assert second.collapsible_sections["z_range"].is_expanded
+    second.close()
+    assert application is not None
+
+
 def test_open_multiple_files_defaults_to_process_and_export_all(sample_ims, tmp_path, monkeypatch, gui_settings):
     application = QApplication.instance() or QApplication([])
     second_path = tmp_path / "second.ims"
@@ -252,6 +314,7 @@ def test_batch_worker_exports_every_selected_source(sample_ims, tmp_path):
     assert len(outcomes) == 1
     assert len(outcomes[0].results) == 6
     assert len(outcomes[0].info_paths) == 2
+    assert len(outcomes[0].summary_paths) == 2
     assert not outcomes[0].errors
     assert not outcomes[0].warnings
     assert not outcomes[0].cancelled

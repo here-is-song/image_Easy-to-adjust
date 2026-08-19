@@ -2,7 +2,7 @@ from dataclasses import replace
 
 from iea.batch import adapt_settings_for_metadata
 from iea.ims_reader import IMSReader
-from iea.models import ChannelSelection, ExportSettings
+from iea.models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings
 
 
 def test_batch_channels_match_by_name_when_target_order_differs(sample_ims):
@@ -19,14 +19,17 @@ def test_batch_channels_match_by_name_when_target_order_differs(sample_ims):
     )
     settings = ExportSettings(z_start=1, z_end=3, channel_indices=(0, 1))
     selections = (
-        ChannelSelection(0, "Green", 2.0, 15.0),
-        ChannelSelection(1, "Red/Marker", 1.0, 20.0),
+        ChannelSelection(0, "Green", 2.0, 15.0, 0.8),
+        ChannelSelection(1, "Red/Marker", 1.0, 20.0, 1.4),
     )
 
     matched = adapt_settings_for_metadata(settings, selections, swapped_metadata)
 
     assert matched.settings.channel_indices == (1, 0)
-    assert matched.display_ranges == {1: (2.0, 15.0), 0: (1.0, 20.0)}
+    assert matched.display_adjustments == {
+        1: DisplayAdjustmentSettings(2.0, 15.0, 0.8),
+        0: DisplayAdjustmentSettings(1.0, 20.0, 1.4),
+    }
     assert not matched.warnings
 
 

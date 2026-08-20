@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import h5py
@@ -59,4 +60,22 @@ def sample_ims(tmp_path: Path) -> Path:
         red[2] = 20
         time_point.create_dataset("Channel 0/Data", data=green)
         time_point.create_dataset("Channel 1/Data", data=red)
+    return path
+
+
+@pytest.fixture
+def sample_three_channel_ims(sample_ims: Path, tmp_path: Path) -> Path:
+    path = tmp_path / "three-channel.ims"
+    shutil.copyfile(sample_ims, path)
+    with h5py.File(path, "r+") as h5_file:
+        channel_info = h5_file.create_group("DataSetInfo/Channel 2")
+        channel_info.attrs["Name"] = np.bytes_("Blue")
+        channel_info.attrs["Color"] = np.bytes_("0 0 1")
+        channel_info.attrs["ColorRange"] = np.bytes_("0 20")
+        channel_info.attrs["GammaCorrection"] = np.bytes_("1.0")
+        blue = np.zeros((3, 4, 5), dtype=np.uint16)
+        blue[0] = 3
+        blue[1] = 12
+        blue[2] = 18
+        h5_file["DataSet/ResolutionLevel 0/TimePoint 0"].create_dataset("Channel 2/Data", data=blue)
     return path

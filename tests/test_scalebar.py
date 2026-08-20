@@ -32,4 +32,38 @@ def test_draw_scale_bar_accepts_manual_thickness_and_font_size():
     )
     margin_y = max(4, round(source.shape[0] * 0.03))
     y_bar = source.shape[0] - margin_y - 7
-    assert np.all(output[y_bar : y_bar + 7, -59:-8] == 255)
+    bar_columns = np.flatnonzero(output[y_bar] == 255)
+    assert len(bar_columns) == 50
+    assert np.all(output[y_bar : y_bar + 7, bar_columns[0] : bar_columns[-1] + 1] == 255)
+
+
+def test_large_scale_bar_text_stays_complete_and_moves_bar_left():
+    source = np.zeros((260, 500), dtype=np.uint8)
+    small_text, _ = draw_scale_bar(
+        source,
+        voxel_size_x_um=1.0,
+        scale_bar_um=20,
+        thickness_px=10,
+        font_size_px=20,
+    )
+    large_text, _ = draw_scale_bar(
+        source,
+        voxel_size_x_um=1.0,
+        scale_bar_um=20,
+        thickness_px=10,
+        font_size_px=500,
+    )
+
+    margin_x = max(4, round(source.shape[1] * 0.03))
+    margin_y = max(4, round(source.shape[0] * 0.03))
+    y_bar = source.shape[0] - margin_y - 10
+    small_bar = np.flatnonzero(small_text[y_bar] == 255)
+    large_bar = np.flatnonzero(large_text[y_bar] == 255)
+    large_pixels = np.argwhere(large_text == 255)
+
+    assert len(small_bar) == len(large_bar) == 20
+    assert large_bar[0] < small_bar[0]
+    assert large_pixels[:, 1].min() >= margin_x
+    assert large_pixels[:, 1].max() < source.shape[1] - margin_x
+    assert large_pixels[:, 0].min() >= margin_y
+    assert large_pixels[:, 0].max() < source.shape[0] - margin_y

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,13 +56,13 @@ class PreviewWorker(QObject):
         source_path: Path,
         settings: ExportSettings,
         display_adjustments: Mapping[int, DisplayAdjustmentSettings],
-        preview_channel: int | None,
+        preview_selection: int | tuple[int, ...],
     ) -> None:
         super().__init__()
         self.source_path = source_path
         self.settings = settings
         self.display_adjustments = dict(display_adjustments)
-        self.preview_channel = preview_channel
+        self.preview_selection = preview_selection
 
     @Slot()
     def run(self) -> None:
@@ -70,14 +70,15 @@ class PreviewWorker(QObject):
             with IMSReader(self.source_path) as reader:
                 if reader.metadata is None:
                     raise IMSReaderError("IMS metadata could not be read.")
-                if self.preview_channel is None:
-                    image, _ = render_merge(reader, self.settings, self.display_adjustments)
+                if isinstance(self.preview_selection, tuple):
+                    preview_settings = replace(self.settings, merge_channel_indices=self.preview_selection)
+                    image, _ = render_merge(reader, preview_settings, self.display_adjustments)
                 else:
                     image, _ = render_single_channel(
                         reader,
                         self.settings,
-                        self.preview_channel,
-                        self.display_adjustments.get(self.preview_channel),
+                        self.preview_selection,
+                        self.display_adjustments.get(self.preview_selection),
                     )
                 output_image, _ = prepare_output_image(image, reader, self.settings)
                 self.finished.emit(_downsample_for_preview(output_image))
@@ -126,8 +127,8 @@ class ExportWorker(QObject):
                     if reader.metadata is None:
                         raise IMSReaderError("IMS metadata could not be read.")
                     matched = adapt_settings_for_metadata(self.settings, self.channel_selections, reader.metadata)
-                    if not matched.settings.channel_indices:
-                        raise IMSReaderError("None of the selected channel names exist in this file.")
+                    if not matched.settings.required_output_channel_indices:
+                        raise IMSReaderError("None of the requested output channels exist in this file.")
                     warnings.extend(f"{source_path.name}: {message}" for message in matched.warnings)
                     results = export_channels_and_merge(
                         reader,

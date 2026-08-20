@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from iea.exporter import (
     export_merge,
     export_single_channels,
     format_ppt_summary,
+    render_merge,
     render_single_channel,
     write_export_info,
     write_ppt_summary,
@@ -62,6 +64,26 @@ def test_single_channel_render_uses_gamma_override(sample_ims):
     assert record.gamma == 2.0
 
 
+def test_red_to_magenta_toggle_changes_merge_rendering(sample_ims):
+    base_settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(1,),
+        merge_channel_indices=(1,),
+        scale_bar=ScaleBarSettings(enabled=False),
+        red_to_magenta=True,
+    )
+    with IMSReader(sample_ims) as reader:
+        magenta, _ = render_merge(reader, base_settings)
+        red, _ = render_merge(reader, replace(base_settings, red_to_magenta=False))
+
+    assert np.all(magenta[..., 0] == 255)
+    assert np.all(magenta[..., 1] == 0)
+    assert np.all(magenta[..., 2] == 255)
+    assert np.all(red[..., 0] == 255)
+    assert np.all(red[..., 1:] == 0)
+
+
 def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     output_dir = tmp_path / "output"
     settings = ExportSettings(
@@ -85,6 +107,9 @@ def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     assert payload["output_width_px"] == 640
     assert payload["output_height_px"] == 480
     assert payload["output_dpi"] == 600
+    assert payload["single_channel_indices"] == [0, 1]
+    assert payload["merge_channel_indices"] == [0, 1]
+    assert payload["merge_channel_groups"] == [[0, 1]]
     assert len(payload["channels"]) == 2
     assert payload["channels"][1]["original_color"] == [1.0, 0.0, 0.0]
     assert payload["channels"][1]["output_color"] == [1.0, 0.0, 1.0]
@@ -94,6 +119,11 @@ def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     assert payload["acquisition"]["scan_speed_us_per_pixel"] == 10.0
     assert payload["objective_detection"]["objective_key"] == "10X"
     assert payload["objective_detection"]["detection_source"] == "Metadata"
+    assert payload["objective_detection"]["measured_fov_x_um"] == 2.5
+    assert payload["objective_detection"]["measured_fov_y_um"] == 4.0
+    assert payload["objective_detection"]["scan_zoom"] == 1.5
+    assert payload["objective_detection"]["normalized_fov_um"] == 6.0
+    assert payload["objective_detection"]["expected_fov_um"] == 1271.809
     assert payload["selected_objective"]["objective_key"] == "10X"
 
 
@@ -121,6 +151,29 @@ def test_ppt_summary_uses_source_acquisition_and_selected_z_range(sample_ims, tm
     assert summary_path.read_text(encoding="utf-8") == expected
 
 
+def test_ppt_summary_uses_fv1200_name_when_source_model_is_misidentified(sample_ims):
+    settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+    )
+    with IMSReader(sample_ims) as reader:
+        assert reader.metadata is not None
+        metadata = replace(
+            reader.metadata,
+            acquisition=replace(
+                reader.metadata.acquisition,
+                microscope_manufacturer="Olympus",
+                microscope_model="FLUOVIEW FV1000",
+            ),
+        )
+        summary = format_ppt_summary(metadata, settings)
+
+    assert "Microscope: Olympus FV1200" in summary
+    assert "FV1000" not in summary
+
+
 def test_ppt_summary_uses_manual_objective_override(sample_ims):
     settings = ExportSettings(
         z_start=1,
@@ -135,6 +188,23 @@ def test_ppt_summary_uses_manual_objective_override(sample_ims):
         summary = format_ppt_summary(reader.metadata, settings)
 
     assert "Objective lens: UPLSAPO60XS (N.A.1.30)" in summary
+
+
+def test_ppt_summary_labels_a_single_layer_file_without_z_stack_details(sample_ims):
+    settings = ExportSettings(
+        z_start=1,
+        z_end=1,
+        channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+    )
+    with IMSReader(sample_ims) as reader:
+        assert reader.metadata is not None
+        single_layer_metadata = replace(reader.metadata, size_z=1)
+        summary = format_ppt_summary(single_layer_metadata, settings)
+
+    assert summary.endswith("Objective lens: UPLSAPO10X (N.A.0.40), single-layer image;")
+    assert "Z-sectioning interval" not in summary
+    assert "Z-stack thickness" not in summary
 
 
 def test_png_single_channel_and_merge_exports(sample_ims, tmp_path):
@@ -210,6 +280,96 @@ def test_combined_export_projects_each_channel_only_once(sample_ims, tmp_path, m
 
     assert calls == [0, 1]
     assert len(results) == 3
+
+
+def test_custom_single_and_merge_channel_outputs(sample_ims, tmp_path, monkeypatch):
+    settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(0, 1),
+        single_channel_indices=(1,),
+        merge_channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+        output=ImageOutputSettings(format="png"),
+    )
+    with IMSReader(sample_ims) as reader:
+        calls = []
+        original_project = reader.project_z_range
+
+        def counted_project(channel_index, z_start, z_end, chunk_depth=8):
+            calls.append(channel_index)
+            return original_project(channel_index, z_start, z_end, chunk_depth)
+
+        monkeypatch.setattr(reader, "project_z_range", counted_project)
+        results = export_channels_and_merge(reader, settings, tmp_path / "custom")
+
+    assert calls == [1, 0]
+    assert [result.output_kind for result in results] == ["single", "merge"]
+    assert results[0].path.name == "sample_Red_Marker.png"
+    assert results[1].path.name == "sample_Merge.png"
+    assert [record.index for record in results[1].channel_records] == [0]
+    with Image.open(results[1].path) as merged:
+        merged_array = np.asarray(merged)
+    assert np.all(merged_array[..., 0] == 0)
+    assert np.all(merged_array[..., 1] > 0)
+    assert np.all(merged_array[..., 2] == 0)
+
+
+def test_export_can_create_single_channels_without_a_merge(sample_ims, tmp_path):
+    settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(0, 1),
+        single_channel_indices=(0,),
+        merge_channel_indices=(),
+        scale_bar=ScaleBarSettings(enabled=False),
+    )
+    with IMSReader(sample_ims) as reader:
+        results = export_channels_and_merge(reader, settings, tmp_path / "single-only")
+
+    assert len(results) == 1
+    assert results[0].output_kind == "single"
+    assert results[0].path.name == "sample_Green.tif"
+
+
+def test_export_creates_multiple_named_merge_combinations_once(
+    sample_three_channel_ims,
+    tmp_path,
+    monkeypatch,
+):
+    settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(0, 1, 2),
+        single_channel_indices=(0,),
+        merge_channel_indices=(1, 2),
+        merge_channel_groups=((1, 2), (0, 1), (0, 1, 2)),
+        scale_bar=ScaleBarSettings(enabled=False),
+    )
+    with IMSReader(sample_three_channel_ims) as reader:
+        calls = []
+        original_project = reader.project_z_range
+
+        def counted_project(channel_index, z_start, z_end, chunk_depth=8):
+            calls.append(channel_index)
+            return original_project(channel_index, z_start, z_end, chunk_depth)
+
+        monkeypatch.setattr(reader, "project_z_range", counted_project)
+        results = export_channels_and_merge(reader, settings, tmp_path / "multi-combination")
+
+    assert calls == [0, 1, 2]
+    assert [result.output_kind for result in results] == ["single", "merge", "merge", "merge"]
+    assert [result.path.name for result in results] == [
+        "three-channel_Green.tif",
+        "three-channel_Merge_Red_Marker_Blue.tif",
+        "three-channel_Merge_Green_Red_Marker.tif",
+        "three-channel_Merge_Green_Red_Marker_Blue.tif",
+    ]
+    assert [[record.index for record in result.channel_records] for result in results[1:]] == [
+        [1, 2],
+        [0, 1],
+        [0, 1, 2],
+    ]
 
 
 @pytest.mark.parametrize(

@@ -2,8 +2,67 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QLayout, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QCursor, QEnterEvent, QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import QFrame, QLayout, QMenu, QToolButton, QVBoxLayout, QWidget
+
+
+class PersistentSelectionMenu(QMenu):
+    """Keep checkable choices open until the pointer leaves the menu tree."""
+
+    def __init__(
+        self,
+        title: str,
+        parent: QWidget | None = None,
+        root_menu: PersistentSelectionMenu | None = None,
+    ) -> None:
+        super().__init__(title, parent)
+        self._root_menu = root_menu or self
+        if root_menu is None:
+            # A short bridge prevents accidental closing while the pointer moves
+            # through the small gap between a parent menu and its submenu.
+            self._leave_timer = QTimer(self)
+            self._leave_timer.setSingleShot(True)
+            self._leave_timer.setInterval(120)
+            self._leave_timer.timeout.connect(self._close_if_pointer_outside)
+            self.aboutToHide.connect(self._leave_timer.stop)
+
+    def add_persistent_menu(self, title: str) -> PersistentSelectionMenu:
+        submenu = PersistentSelectionMenu(title, self, self._root_menu)
+        self.addMenu(submenu)
+        return submenu
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        self._root_menu._leave_timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._root_menu._leave_timer.start()
+        super().leaveEvent(event)
+
+    def _close_if_pointer_outside(self) -> None:
+        pointer = QCursor.pos()
+        menus = (self._root_menu, *self._root_menu.findChildren(PersistentSelectionMenu))
+        if any(menu.isVisible() and menu.rect().contains(menu.mapFromGlobal(pointer)) for menu in menus):
+            return
+        self._root_menu.close()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if action is not None and action.isEnabled() and action.isCheckable():
+            action.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        action = self.activeAction()
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            if action is not None and action.isEnabled() and action.isCheckable():
+                action.trigger()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class CollapsibleSection(QFrame):

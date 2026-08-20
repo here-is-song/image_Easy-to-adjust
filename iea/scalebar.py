@@ -57,6 +57,36 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _fit_label_font(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    requested_size: int,
+    available_width: int,
+    available_height: int,
+    thickness: int,
+    gap: int,
+) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, tuple[int, int, int, int]]:
+    """Use the requested size when possible, otherwise choose the largest complete fit."""
+
+    best_font = _load_font(1)
+    best_bbox = draw.textbbox((0, 0), label, font=best_font)
+    lower = 1
+    upper = max(1, requested_size)
+    while lower <= upper:
+        candidate_size = (lower + upper) // 2
+        candidate_font = _load_font(candidate_size)
+        candidate_bbox = draw.textbbox((0, 0), label, font=candidate_font)
+        text_width = candidate_bbox[2] - candidate_bbox[0]
+        text_height = candidate_bbox[3] - candidate_bbox[1]
+        if text_width <= available_width and text_height + gap + thickness <= available_height:
+            best_font = candidate_font
+            best_bbox = candidate_bbox
+            lower = candidate_size + 1
+        else:
+            upper = candidate_size - 1
+    return best_font, best_bbox
+
+
 def draw_scale_bar(
     image: NDArray[np.uint8],
     voxel_size_x_um: float,
@@ -95,19 +125,38 @@ def draw_scale_bar(
     if font_size_px is not None and font_size_px <= 0:
         raise ValueError("Scale-bar font size must be positive when specified.")
     thickness = int(thickness_px) if thickness_px is not None else max(3, int(round(content_height * 0.004)))
-    x_right = right - margin_x
-    x_left = x_right - bar_width
-    y_bar = bottom - margin_y - thickness
-    draw.rectangle((x_left, y_bar, x_right, y_bar + thickness - 1), fill=white)
-
     font_size = int(font_size_px) if font_size_px is not None else max(10, int(round(content_height * 0.035)))
-    font = _load_font(font_size)
     label_value = int(chosen_um) if chosen_um.is_integer() else chosen_um
     label = f"{label_value} µm"
-    bbox = draw.textbbox((0, 0), label, font=font)
+    gap = max(2, thickness)
+    available_width = content_width - 2 * margin_x
+    available_height = content_height - 2 * margin_y
+    font, bbox = _fit_label_font(
+        draw,
+        label,
+        font_size,
+        available_width,
+        available_height,
+        thickness,
+        gap,
+    )
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
-    text_x = int(round((x_left + x_right - text_width) / 2))
-    text_y = max(top, y_bar - text_height - max(2, thickness))
-    draw.text((text_x, text_y), label, fill=white, font=font)
+    if text_width > available_width or text_height + gap + thickness > available_height:
+        raise ValueError("Scale-bar label and bar do not fit inside the available image area.")
+
+    # Right-align the complete text/bar group. A wider label moves the bar left
+    # with it instead of allowing either side of the text to be clipped.
+    group_width = max(bar_width, text_width)
+    group_right = right - margin_x
+    group_left = group_right - group_width
+    x_left = group_left + (group_width - bar_width) // 2
+    x_right = x_left + bar_width
+    y_bar = bottom - margin_y - thickness
+    text_left = group_left + (group_width - text_width) // 2
+    text_top = y_bar - gap - text_height
+    text_origin = (text_left - bbox[0], text_top - bbox[1])
+
+    draw.rectangle((x_left, y_bar, x_right - 1, y_bar + thickness - 1), fill=white)
+    draw.text(text_origin, label, fill=white, font=font)
     return np.asarray(pil_image), chosen_um

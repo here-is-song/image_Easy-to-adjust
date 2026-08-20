@@ -51,6 +51,29 @@ def test_missing_gamma_uses_linear_default(sample_ims):
     assert any("Gamma correction not found for Green" in warning for warning in metadata.warnings)
 
 
+def test_known_fluorophores_use_stable_colors_when_color_metadata_is_missing(sample_three_channel_ims):
+    names = ("Alexa Fluor 488", "Alexa Fluor 594", "DRAQ5")
+    with h5py.File(sample_three_channel_ims, "r+") as h5_file:
+        for index, name in enumerate(names):
+            channel = h5_file[f"DataSetInfo/Channel {index}"]
+            channel.attrs["Name"] = np.bytes_(name)
+            del channel.attrs["Color"]
+
+    with IMSReader(sample_three_channel_ims) as reader:
+        metadata = reader.metadata
+
+    assert metadata is not None
+    assert tuple(channel.color for channel in metadata.channels) == (
+        (0.0, 1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    assert any(
+        "Color missing for Alexa Fluor 594; fallback color (1.0, 0.0, 0.0) is used." == warning
+        for warning in metadata.warnings
+    )
+
+
 def test_reads_only_requested_inclusive_z_range(sample_ims):
     with IMSReader(sample_ims) as reader:
         selected = reader.read_z_range(channel_index=0, z_start=2, z_end=3)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -44,13 +46,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .exporter import default_output_directory
 from .fv1200_calibration import FV1200_OBJECTIVES
-from .gui_controls import CollapsibleSection
+from .gui_controls import CollapsibleSection, PersistentSelectionMenu
 from .gui_dialogs import ExportImageSettingsDialog
 from .gui_workers import BatchExportOutcome, ExportWorker, PreviewWorker
 from .ims_reader import IMSReader, IMSReaderError
 from .models import (
+    ChannelMetadata,
     ChannelSelection,
     DisplayAdjustmentSettings,
     ExportSettings,
@@ -60,6 +64,9 @@ from .models import (
 )
 from .objective_detector import apply_manual_objective, detect_objective
 from .settings_store import SettingsStore
+from .theme import apply_dark_theme
+
+GITHUB_REPOSITORY_URL = "https://github.com/here-is-song/image_Easy-to-adjust"
 
 
 @dataclass
@@ -81,12 +88,18 @@ class IMSFigureExporterWindow(QMainWindow):
 
     def __init__(self, app_settings: QSettings | None = None) -> None:
         super().__init__()
+        application = QApplication.instance()
+        if application is not None:
+            apply_dark_theme(application)
         self.settings_store = SettingsStore(app_settings)
         stored = self.settings_store.load()
         self.metadata: IMSMetadata | None = None
         self.batch_metadata: dict[Path, IMSMetadata] = {}
         self.channel_controls: dict[int, ChannelControls] = {}
+        self.output_image_actions: dict[tuple[int, ...], QAction] = {}
+        self.output_selection_name_groups: tuple[tuple[str, ...], ...] | None = None
         self.output_directory = stored.gui.output_directory
+        self.last_input_directory = stored.gui.last_input_directory
         self.output_width_px = stored.output.width_px or 1000
         self.output_height_px = stored.output.height_px or 1000
         self.output_dpi = stored.output.dpi
@@ -180,6 +193,10 @@ class IMSFigureExporterWindow(QMainWindow):
         clear_export.triggered.connect(lambda: self._set_batch_column_checked(2, False))
         batch_menu.addAction(clear_export)
 
+        self.output_images_menu = PersistentSelectionMenu("&Output Images", self)
+        self.menuBar().addMenu(self.output_images_menu)
+        self.output_images_menu.setEnabled(False)
+
         export_menu = self.menuBar().addMenu("&Export")
         self.export_settings_action = QAction("Export Image Settings…", self)
         self.export_settings_action.triggered.connect(self.open_export_settings)
@@ -190,6 +207,15 @@ class IMSFigureExporterWindow(QMainWindow):
         self.export_action.setEnabled(False)
         self.export_action.triggered.connect(self.export_tiffs)
         export_menu.addAction(self.export_action)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        self.github_action = QAction("Open GitHub Repository", self)
+        self.github_action.triggered.connect(self.open_github_repository)
+        help_menu.addAction(self.github_action)
+        help_menu.addSeparator()
+        self.about_action = QAction("About IEA", self)
+        self.about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(self.about_action)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("image_easy-to-adjust (IEA)")
@@ -217,9 +243,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self.metadata_label = QLabel("Open an IMS file to view metadata.")
         root.addWidget(self.metadata_label)
         self.warning_label = QLabel()
-        self.warning_label.setWordWrap(True)
-        self.warning_label.setStyleSheet("color: #9a6700;")
-        root.addWidget(self.warning_label)
+        self.warning_label.setWordWrap(False)
+        self.warning_label.setMinimumWidth(0)
+        self.warning_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.warning_label.setStyleSheet("color: #F0B44D;")
+        self.warning_label.setVisible(False)
 
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.content_splitter.setChildrenCollapsible(False)
@@ -247,6 +275,14 @@ class IMSFigureExporterWindow(QMainWindow):
         self.left_layout.addWidget(batch_group)
         self.channels_group = self._create_collapsible_section("channels", "Channels")
         self.channels_layout = QVBoxLayout()
+        self.channel_rows_widget = QWidget()
+        self.channel_rows_layout = QVBoxLayout(self.channel_rows_widget)
+        self.channel_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.channels_layout.addWidget(self.channel_rows_widget)
+        self.red_to_magenta = QCheckBox("Convert red to magenta")
+        self.red_to_magenta.setChecked(True)
+        self.red_to_magenta.toggled.connect(self._schedule_preview_refresh)
+        self.channels_layout.addWidget(self.red_to_magenta)
         self.channels_group.set_content_layout(self.channels_layout)
         self.left_layout.addWidget(self.channels_group)
         self._build_settings_groups()
@@ -304,6 +340,8 @@ class IMSFigureExporterWindow(QMainWindow):
             "QSplitter::handle { background-color: palette(mid); }"
             "QSplitter::handle:hover { background-color: palette(highlight); }"
         )
+
+        root.addWidget(self.warning_label)
 
         bottom = QHBoxLayout()
         self.status_label = QLabel("Ready")
@@ -388,21 +426,19 @@ class IMSFigureExporterWindow(QMainWindow):
         self.scale_thickness.setRange(0, 1000)
         self.scale_thickness.setSpecialValueText("Auto")
         self.scale_thickness.setSuffix(" px")
+        self.scale_thickness.setValue(10)
         self.scale_thickness.valueChanged.connect(self._schedule_preview_refresh)
         self.scale_font_size = QSpinBox()
         self.scale_font_size.setRange(0, 1000)
         self.scale_font_size.setSpecialValueText("Auto")
         self.scale_font_size.setSuffix(" px")
+        self.scale_font_size.setValue(50)
         self.scale_font_size.valueChanged.connect(self._schedule_preview_refresh)
-        self.red_to_magenta = QCheckBox("Convert red to magenta")
-        self.red_to_magenta.setChecked(True)
-        self.red_to_magenta.toggled.connect(self._schedule_preview_refresh)
         scale_form.addRow(self.include_scale_bar)
         scale_form.addRow(self.auto_scale)
         scale_form.addRow("Manual length:", self.scale_length)
         scale_form.addRow("Bar thickness:", self.scale_thickness)
         scale_form.addRow("Text size:", self.scale_font_size)
-        scale_form.addRow(self.red_to_magenta)
         scale_group.content_widget.setLayout(scale_form)
         self.left_layout.addWidget(scale_group)
 
@@ -454,7 +490,17 @@ class IMSFigureExporterWindow(QMainWindow):
 
     @Slot()
     def open_ims(self) -> None:
-        filenames, _ = QFileDialog.getOpenFileNames(self, "Open IMS files", "", "IMS files (*.ims);;All files (*)")
+        initial_directory = (
+            str(self.last_input_directory)
+            if self.last_input_directory is not None and self.last_input_directory.is_dir()
+            else ""
+        )
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Open IMS files",
+            initial_directory,
+            "IMS files (*.ims);;All files (*)",
+        )
         if not filenames:
             return
         loaded: dict[Path, IMSMetadata] = {}
@@ -472,7 +518,10 @@ class IMSFigureExporterWindow(QMainWindow):
             QMessageBox.critical(self, "Unable to open IMS files", "\n".join(errors))
             return
 
+        self.last_input_directory = next(iter(loaded)).parent
+        self.settings_store.save_last_input_directory(self.last_input_directory)
         self.batch_metadata = loaded
+        self.output_selection_name_groups = None
         self.last_output_directory = None
         self.batch_tree.blockSignals(True)
         self.batch_tree.clear()
@@ -505,7 +554,7 @@ class IMSFigureExporterWindow(QMainWindow):
             f"{metadata.voxel_size_x_um:.6g} x {metadata.voxel_size_y_um:.6g} x "
             f"{metadata.voxel_size_z_um:.6g} um"
         )
-        self.warning_label.setText("\n".join(metadata.warnings))
+        self._update_warning_display(metadata.warnings)
         self._sync_output_folder_controls()
         self._populate_channels(metadata)
         self.z_start.setRange(1, metadata.size_z)
@@ -568,8 +617,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self.export_action.setEnabled(enabled)
 
     def _populate_channels(self, metadata: IMSMetadata) -> None:
-        while self.channels_layout.count():
-            item = self.channels_layout.takeAt(0)
+        while self.channel_rows_layout.count():
+            item = self.channel_rows_layout.takeAt(0)
             if item.widget() is not None:
                 item.widget().deleteLater()
         self.channel_controls.clear()
@@ -594,6 +643,7 @@ class IMSFigureExporterWindow(QMainWindow):
             self._bind_spinbox_and_slider(maximum, maximum_slider, slider_minimum, slider_maximum)
             self._bind_spinbox_and_slider(gamma, gamma_slider, 0.1, 5.0)
             include.toggled.connect(self._schedule_preview_refresh)
+            include.toggled.connect(self._sync_output_action_availability)
             minimum.valueChanged.connect(self._schedule_preview_refresh)
             maximum.valueChanged.connect(self._schedule_preview_refresh)
             gamma.valueChanged.connect(self._schedule_preview_refresh)
@@ -626,7 +676,7 @@ class IMSFigureExporterWindow(QMainWindow):
                 use_data_minmax.toggled.connect(maximum_slider.setDisabled)
                 use_data_minmax.toggled.connect(self._schedule_preview_refresh)
                 layout.addWidget(use_data_minmax, 5, 0, 1, 3)
-            self.channels_layout.addWidget(row)
+            self.channel_rows_layout.addWidget(row)
             self.channel_controls[channel.index] = ChannelControls(
                 include,
                 minimum,
@@ -637,7 +687,14 @@ class IMSFigureExporterWindow(QMainWindow):
                 gamma_slider,
                 use_data_minmax,
             )
+        self._populate_output_images_menu(metadata)
         self._populate_preview_choices()
+
+    def _update_warning_display(self, warnings: tuple[str, ...]) -> None:
+        warning_text = "    ".join(" ".join(warning.splitlines()) for warning in warnings)
+        self.warning_label.setText(warning_text)
+        self.warning_label.setToolTip(warning_text)
+        self.warning_label.setVisible(bool(warning_text))
 
     @staticmethod
     def _range_spinbox(value: float | None, fallback: float) -> QDoubleSpinBox:
@@ -655,6 +712,129 @@ class IMSFigureExporterWindow(QMainWindow):
         spinbox.setSingleStep(0.05)
         spinbox.setValue(value)
         return spinbox
+
+    def _populate_output_images_menu(self, metadata: IMSMetadata) -> None:
+        """Build checkable single-, two-, and three-color export choices."""
+
+        self.output_images_menu.clear()
+        self.output_image_actions.clear()
+
+        clear_action = self.output_images_menu.addAction("Clear All Selections")
+        clear_action.triggered.connect(lambda: self._set_all_output_actions(False))
+        select_all_action = self.output_images_menu.addAction("Select All Listed Outputs")
+        select_all_action.triggered.connect(lambda: self._set_all_output_actions(True))
+        self.output_images_menu.addSeparator()
+
+        channel_indices = tuple(channel.index for channel in metadata.channels)
+        channel_names = {channel.index: self._channel_menu_label(channel) for channel in metadata.channels}
+        raw_channel_names = {channel.index: channel.name for channel in metadata.channels}
+        requested_groups = (
+            {frozenset(name.casefold() for name in group) for group in self.output_selection_name_groups}
+            if self.output_selection_name_groups is not None
+            else None
+        )
+        categories = (
+            ("Three-color Merge", 3),
+            ("Two-color Merge", 2),
+            ("Single-color", 1),
+        )
+        for title, group_size in categories:
+            submenu = self.output_images_menu.add_persistent_menu(title)
+            groups = tuple(combinations(channel_indices, group_size))
+            submenu.setEnabled(bool(groups))
+            for group in groups:
+                label = " + ".join(channel_names[index] for index in group)
+                action = QAction(label, self, checkable=True)
+                # Preserve the former default: every single channel plus one merge
+                # containing all channels when the file has two or three channels.
+                default_checked = group_size == 1 or (
+                    group_size == len(channel_indices) and group_size > 1
+                )
+                group_name_key = frozenset(raw_channel_names[index].casefold() for index in group)
+                action.setChecked(
+                    default_checked if requested_groups is None else group_name_key in requested_groups
+                )
+                action.toggled.connect(self._output_selection_changed)
+                submenu.addAction(action)
+                self.output_image_actions[group] = action
+
+        if len(channel_indices) > 3:
+            multi_menu = self.output_images_menu.add_persistent_menu("Four-or-more-color Merge")
+            action = QAction(" + ".join(channel_names[index] for index in channel_indices), self, checkable=True)
+            group_name_key = frozenset(raw_channel_names[index].casefold() for index in channel_indices)
+            action.setChecked(True if requested_groups is None else group_name_key in requested_groups)
+            action.toggled.connect(self._output_selection_changed)
+            multi_menu.addAction(action)
+            self.output_image_actions[channel_indices] = action
+
+        self.output_images_menu.setEnabled(bool(channel_indices))
+        self._sync_output_action_availability()
+        if self.output_selection_name_groups is None:
+            self.output_selection_name_groups = self._checked_output_name_groups()
+
+    @staticmethod
+    def _channel_menu_label(channel: ChannelMetadata) -> str:
+        red, green, blue = channel.color
+        maximum = max(red, green, blue)
+        if maximum <= 0:
+            color_name = "Gray"
+        else:
+            active = tuple(component >= maximum * 0.6 for component in (red, green, blue))
+            color_name = {
+                (True, False, False): "Red",
+                (False, True, False): "Green",
+                (False, False, True): "Blue",
+                (True, True, False): "Yellow",
+                (False, True, True): "Cyan",
+                (True, False, True): "Magenta",
+                (True, True, True): "White",
+            }.get(active, "Mixed")
+        return f"[{color_name}] {channel.name}"
+
+    def _set_all_output_actions(self, checked: bool) -> None:
+        for action in self.output_image_actions.values():
+            if action.isEnabled():
+                action.blockSignals(True)
+                action.setChecked(checked)
+                action.blockSignals(False)
+        self._output_selection_changed()
+
+    def _selected_output_groups(self) -> tuple[tuple[int, ...], ...]:
+        enabled_channels = {
+            index for index, controls in self.channel_controls.items() if controls.include.isChecked()
+        }
+        return tuple(
+            group
+            for group, action in self.output_image_actions.items()
+            if action.isChecked() and set(group).issubset(enabled_channels)
+        )
+
+    def _checked_output_name_groups(self) -> tuple[tuple[str, ...], ...]:
+        if self.metadata is None:
+            return ()
+        channel_names = {channel.index: channel.name for channel in self.metadata.channels}
+        return tuple(
+            tuple(channel_names[index] for index in group)
+            for group, action in self.output_image_actions.items()
+            if action.isChecked()
+        )
+
+    @Slot()
+    def _sync_output_action_availability(self) -> None:
+        enabled_channels = {
+            index for index, controls in self.channel_controls.items() if controls.include.isChecked()
+        }
+        for group, action in self.output_image_actions.items():
+            action.setEnabled(set(group).issubset(enabled_channels))
+        self._populate_preview_choices()
+
+    @Slot()
+    def _output_selection_changed(self) -> None:
+        self.output_selection_name_groups = self._checked_output_name_groups()
+        self._populate_preview_choices()
+        selected_count = len(self._selected_output_groups())
+        self.status_label.setText(f"Output image selection updated: {selected_count} image(s) per IMS file.")
+        self._schedule_preview_refresh()
 
     @staticmethod
     def _parameter_slider() -> QSlider:
@@ -700,11 +880,22 @@ class IMSFigureExporterWindow(QMainWindow):
         current = self.preview_combo.currentData()
         self.preview_combo.blockSignals(True)
         self.preview_combo.clear()
-        self.preview_combo.addItem("Merge", None)
         if self.metadata is not None:
+            channel_names = {channel.index: channel.name for channel in self.metadata.channels}
+            for group in self._selected_output_groups():
+                if len(group) > 1:
+                    label = " + ".join(channel_names[index] for index in group)
+                    self.preview_combo.addItem(f"Merge: {label}", group)
             for channel in self.metadata.channels:
                 self.preview_combo.addItem(channel.name, channel.index)
-        index = self.preview_combo.findData(current)
+        index = next(
+            (
+                position
+                for position in range(self.preview_combo.count())
+                if self.preview_combo.itemData(position) == current
+            ),
+            -1,
+        )
         self.preview_combo.setCurrentIndex(index if index >= 0 else 0)
         self.preview_combo.blockSignals(False)
 
@@ -754,6 +945,15 @@ class IMSFigureExporterWindow(QMainWindow):
             f"{selected.objective_key} — {selected.model}" if selected.objective_key is not None else "Unknown"
         )
         z_spacing = f"{selected.measured_z_spacing_um:.6g} µm" if selected.measured_z_spacing_um is not None else "N/A"
+        if selected.measured_fov_x_um is not None or selected.measured_fov_y_um is not None:
+            fov_x = f"{selected.measured_fov_x_um:.6g}" if selected.measured_fov_x_um is not None else "N/A"
+            fov_y = f"{selected.measured_fov_y_um:.6g}" if selected.measured_fov_y_um is not None else "N/A"
+            zoom = f"{selected.scan_zoom:.6g}" if selected.scan_zoom is not None else "N/A"
+            fov_text = f"{fov_x} × {fov_y} µm · ScanZoom {zoom}"
+            if selected.normalized_fov_um is not None:
+                fov_text += f" · normalized {selected.normalized_fov_um:.6g} µm"
+        else:
+            fov_text = "N/A"
         na = f"{selected.na:.2f}" if selected.na is not None else "N/A"
         immersion = selected.immersion or "N/A"
         warning = f"\nWarning: {selected.warning}" if selected.warning else ""
@@ -767,6 +967,7 @@ class IMSFigureExporterWindow(QMainWindow):
             f"Selected: {selected_text}\n"
             f"NA: {na} · Immersion: {immersion}\n"
             f"Z spacing: {z_spacing}\n"
+            f"XY FOV: {fov_text}\n"
             f"Detection: {detection_text}{warning}"
         )
 
@@ -791,10 +992,16 @@ class IMSFigureExporterWindow(QMainWindow):
                 else:
                     self.status_label.setText(message)
                 return None
+        output_groups = self._selected_output_groups()
+        single_indices = tuple(group[0] for group in output_groups if len(group) == 1)
+        merge_groups = tuple(group for group in output_groups if len(group) > 1)
         return ExportSettings(
             z_start=self.z_start.value(),
             z_end=self.z_end.value(),
             channel_indices=channels,
+            single_channel_indices=single_indices,
+            merge_channel_indices=merge_groups[0] if merge_groups else (),
+            merge_channel_groups=merge_groups,
             objective_override=(
                 str(self.objective_combo.currentData()) if self.objective_combo.currentData() is not None else None
             ),
@@ -829,6 +1036,13 @@ class IMSFigureExporterWindow(QMainWindow):
         if self.metadata is None:
             return ()
         display_adjustments = self._display_adjustments()
+        settings = self._current_settings(show_warnings=False)
+        single_indices = set(settings.resolved_single_channel_indices) if settings is not None else set()
+        merge_indices = (
+            {index for group in settings.resolved_merge_channel_groups for index in group}
+            if settings is not None
+            else set()
+        )
         selections: list[ChannelSelection] = []
         for channel in self.metadata.channels:
             controls = self.channel_controls[channel.index]
@@ -842,6 +1056,8 @@ class IMSFigureExporterWindow(QMainWindow):
                     display_min=display_adjustment.display_min,
                     display_max=display_adjustment.display_max,
                     gamma=display_adjustment.gamma,
+                    export_single=channel.index in single_indices,
+                    include_in_merge=channel.index in merge_indices,
                 )
             )
         return tuple(selections)
@@ -861,14 +1077,20 @@ class IMSFigureExporterWindow(QMainWindow):
         if settings is None or self.metadata is None:
             return
         selected_preview = self.preview_combo.currentData()
-        if selected_preview is not None and selected_preview not in settings.channel_indices:
+        if selected_preview is None:
+            return
+        if isinstance(selected_preview, (tuple, list)):
+            preview_selection: int | tuple[int, ...] = tuple(int(index) for index in selected_preview)
+        else:
+            preview_selection = int(selected_preview)
+        if isinstance(preview_selection, int) and preview_selection not in settings.channel_indices:
             message = "Select this channel before previewing it."
             if show_warnings:
                 QMessageBox.warning(self, "Channel not selected", message)
             else:
                 self.status_label.setText(message)
             return
-        worker = PreviewWorker(self.metadata.source_path, settings, self._display_adjustments(), selected_preview)
+        worker = PreviewWorker(self.metadata.source_path, settings, self._display_adjustments(), preview_selection)
         self._run_worker(worker, self._preview_finished)
 
     def _schedule_preview_refresh(self, *_: object) -> None:
@@ -901,6 +1123,13 @@ class IMSFigureExporterWindow(QMainWindow):
     def export_tiffs(self) -> None:
         settings = self._current_settings()
         if settings is None or self.metadata is None:
+            return
+        if not settings.required_output_channel_indices:
+            QMessageBox.warning(
+                self,
+                "No image outputs selected",
+                "Choose at least one item from the Output Images menu.",
+            )
             return
         source_paths = self._selected_export_paths()
         if not source_paths:
@@ -940,6 +1169,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self.open_action.setEnabled(False)
         self.batch_tree.setEnabled(False)
         self.export_settings_action.setEnabled(False)
+        self.output_images_menu.setEnabled(False)
         self.update_button.setEnabled(False)
         self.refresh_preview_action.setEnabled(False)
         self.export_button.setEnabled(False)
@@ -1033,13 +1263,19 @@ class IMSFigureExporterWindow(QMainWindow):
             self.open_output_action.setEnabled(True)
         clipboard_note = ""
         clipboard_copied = False
-        if self.copy_to_clipboard and result_list:
+        merge_result = next(
+            (result for result in reversed(result_list) if result.output_kind == "merge"),
+            None,
+        )
+        if self.copy_to_clipboard and merge_result is not None:
             try:
-                self._copy_image_to_clipboard(result_list[-1].path)
+                self._copy_image_to_clipboard(merge_result.path)
                 clipboard_copied = True
                 clipboard_note = "\nThe merged image was copied to the Clipboard."
             except Exception as exc:
                 clipboard_note = f"\nClipboard copy failed: {exc}"
+        elif self.copy_to_clipboard and result_list:
+            clipboard_note = "\nClipboard copy was skipped because no merge output was selected."
         status_prefix = "Export cancelled" if batch_outcome.cancelled else "Export completed"
         self.status_label.setText(
             f"{status_prefix}: {len(result_list)} image files from "
@@ -1092,6 +1328,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self.open_action.setEnabled(True)
         self.batch_tree.setEnabled(True)
         self.export_settings_action.setEnabled(True)
+        self.output_images_menu.setEnabled(self.metadata is not None)
         self.update_button.setEnabled(self.metadata is not None)
         self.refresh_preview_action.setEnabled(self.metadata is not None)
         self.cancel_button.setEnabled(False)
@@ -1107,6 +1344,29 @@ class IMSFigureExporterWindow(QMainWindow):
         target = self.last_output_directory or self._current_output_directory()
         if target is not None and target.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    @Slot()
+    def open_github_repository(self) -> None:
+        if not QDesktopServices.openUrl(QUrl(GITHUB_REPOSITORY_URL)):
+            QMessageBox.warning(
+                self,
+                "Unable to open GitHub",
+                f"Please open this address manually:\n{GITHUB_REPOSITORY_URL}",
+            )
+
+    @Slot()
+    def show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            "About IEA",
+            f"<h3>image_easy-to-adjust (IEA)</h3>"
+            f"<p>Version {__version__}</p>"
+            "<p>This open-source software was developed by Song Xuanyu with assistance from Codex.</p>"
+            "<p>IEA is designed for simple batch processing of IMS files and is currently developed primarily "
+            "to meet the author's own workflow needs.</p>"
+            '<p>Contact: <a href="mailto:songxuanyuhappy@gmail.com">songxuanyuhappy@gmail.com</a></p>'
+            f'<p>Source code: <a href="{GITHUB_REPOSITORY_URL}">{GITHUB_REPOSITORY_URL}</a></p>',
+        )
 
 
 def launch_gui() -> int:

@@ -5,6 +5,7 @@ from iea.color_mapping import additive_merge, apply_pseudocolor, convert_red_to_
 
 def test_red_becomes_magenta_but_green_is_unchanged():
     assert convert_red_to_magenta((1.0, 0.0, 0.0)) == (1.0, 0.0, 1.0)
+    assert convert_red_to_magenta((1.0, 0.0, 0.0), enabled=False) == (1.0, 0.0, 0.0)
     assert convert_red_to_magenta((0.0, 1.0, 0.0)) == (0.0, 1.0, 0.0)
 
 

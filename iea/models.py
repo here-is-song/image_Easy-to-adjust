@@ -68,6 +68,12 @@ class ObjectiveDetectionResult:
     confidence: str
     detection_source: str
     warning: str | None = None
+    measured_fov_x_um: float | None = None
+    measured_fov_y_um: float | None = None
+    scan_zoom: float | None = None
+    normalized_fov_um: float | None = None
+    expected_fov_um: float | None = None
+    xy_relative_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,8 @@ class ChannelSelection:
     display_min: float | None = None
     display_max: float | None = None
     gamma: float | None = None
+    export_single: bool = True
+    include_in_merge: bool = True
 
     @property
     def display_range(self) -> tuple[float, float] | None:
@@ -156,6 +164,37 @@ class ExportSettings:
     scale_bar: ScaleBarSettings = field(default_factory=ScaleBarSettings)
     output: ImageOutputSettings = field(default_factory=ImageOutputSettings)
     objective_override: str | None = None
+    single_channel_indices: tuple[int, ...] | None = None
+    merge_channel_indices: tuple[int, ...] | None = None
+    merge_channel_groups: tuple[tuple[int, ...], ...] | None = None
+
+    @property
+    def resolved_single_channel_indices(self) -> tuple[int, ...]:
+        """Channels exported independently; None preserves the legacy default."""
+
+        return self.channel_indices if self.single_channel_indices is None else self.single_channel_indices
+
+    @property
+    def resolved_merge_channel_indices(self) -> tuple[int, ...]:
+        """Channels combined into the custom overlay; None preserves the legacy default."""
+
+        return self.channel_indices if self.merge_channel_indices is None else self.merge_channel_indices
+
+    @property
+    def resolved_merge_channel_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Every independently exported merge group."""
+
+        if self.merge_channel_groups is None:
+            legacy_group = self.resolved_merge_channel_indices
+            return (legacy_group,) if legacy_group else ()
+        return tuple(tuple(dict.fromkeys(group)) for group in self.merge_channel_groups if group)
+
+    @property
+    def required_output_channel_indices(self) -> tuple[int, ...]:
+        """Unique channels that must be projected for the requested outputs."""
+
+        merge_indices = tuple(index for group in self.resolved_merge_channel_groups for index in group)
+        return tuple(dict.fromkeys((*self.resolved_single_channel_indices, *merge_indices)))
 
 
 @dataclass(frozen=True)
@@ -163,6 +202,7 @@ class GuiPreferences:
     """Persistent GUI-only behavior that does not alter image pixels."""
 
     output_directory: Path | None = None
+    last_input_directory: Path | None = None
     copy_to_clipboard: bool = False
     preview_refresh_interval_ms: int = 1000
     section_expanded: dict[str, bool] = field(default_factory=dict)

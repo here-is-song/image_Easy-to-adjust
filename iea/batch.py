@@ -32,9 +32,12 @@ def adapt_settings_for_metadata(
         by_name.setdefault(_normalized_channel_name(channel.name), []).append(channel.index)
 
     matched_indices: list[int] = []
+    matched_single_indices: list[int] = []
+    matched_merge_indices: list[int] = []
     display_adjustments: dict[int, DisplayAdjustmentSettings] = {}
     warnings: list[str] = []
     used_indices: set[int] = set()
+    index_mapping: dict[int, int] = {}
     for selection in selections:
         candidates = [
             index for index in by_name.get(_normalized_channel_name(selection.name), []) if index not in used_indices
@@ -49,7 +52,12 @@ def adapt_settings_for_metadata(
         if len(candidates) > 1:
             warnings.append(f"Channel name '{selection.name}' is duplicated; target index {target_index} was used.")
         used_indices.add(target_index)
+        index_mapping[selection.index] = target_index
         matched_indices.append(target_index)
+        if selection.export_single:
+            matched_single_indices.append(target_index)
+        if selection.include_in_merge:
+            matched_merge_indices.append(target_index)
         display_adjustments[target_index] = selection.display_adjustment
 
     z_start = min(max(1, base_settings.z_start), metadata.size_z)
@@ -59,12 +67,26 @@ def adapt_settings_for_metadata(
             f"Z range was adjusted from {base_settings.z_start}–{base_settings.z_end} to {z_start}–{z_end}."
         )
 
+    if base_settings.merge_channel_groups is None:
+        matched_merge_groups = None
+        primary_merge_indices = tuple(matched_merge_indices)
+    else:
+        groups: list[tuple[int, ...]] = []
+        for group in base_settings.resolved_merge_channel_groups:
+            if all(index in index_mapping for index in group):
+                groups.append(tuple(index_mapping[index] for index in group))
+        matched_merge_groups = tuple(groups)
+        primary_merge_indices = groups[0] if groups else ()
+
     return MatchedBatchSettings(
         settings=replace(
             base_settings,
             z_start=z_start,
             z_end=z_end,
             channel_indices=tuple(matched_indices),
+            single_channel_indices=tuple(matched_single_indices),
+            merge_channel_indices=primary_merge_indices,
+            merge_channel_groups=matched_merge_groups,
         ),
         display_adjustments=display_adjustments,
         warnings=tuple(warnings),

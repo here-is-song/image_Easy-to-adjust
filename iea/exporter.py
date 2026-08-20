@@ -35,6 +35,7 @@ class ExportResult:
     dtype: str
     scale_bar_um: float | None
     channel_records: tuple[ChannelExportRecord, ...] = ()
+    output_kind: str = "single"
 
 
 @dataclass(frozen=True)
@@ -163,35 +164,42 @@ def render_merge(
     metadata = reader.metadata
     if metadata is None:
         raise IMSReaderError("Open the IMS file before rendering.")
-    if not settings.channel_indices:
-        raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_adjustments)
-    return merge_rendered_channels(rendered, settings)
+    merge_indices = settings.resolved_merge_channel_indices
+    if not merge_indices:
+        raise IMSReaderError("At least one channel must be selected for the merge overlay.")
+    rendered = render_selected_channels(reader, settings, display_adjustments, merge_indices)
+    return merge_rendered_channels(rendered, settings, merge_indices)
 
 
 def render_selected_channels(
     reader: IMSReader,
     settings: ExportSettings,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
+    channel_indices: tuple[int, ...] | None = None,
 ) -> dict[int, tuple[np.ndarray, ChannelExportRecord]]:
     """Render every selected grayscale channel once for reuse by all outputs."""
 
     adjustment_overrides = display_adjustments or {}
+    selected_indices = settings.channel_indices if channel_indices is None else channel_indices
     return {
         channel_index: render_single_channel(reader, settings, channel_index, adjustment_overrides.get(channel_index))
-        for channel_index in settings.channel_indices
+        for channel_index in selected_indices
     }
 
 
 def merge_rendered_channels(
     rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
     settings: ExportSettings,
+    channel_indices: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, tuple[ChannelExportRecord, ...]]:
     """Create an RGB merge from already-rendered grayscale channels."""
 
     pseudocolor_images: list[np.ndarray] = []
     records: list[ChannelExportRecord] = []
-    for channel_index in settings.channel_indices:
+    selected_indices = settings.resolved_merge_channel_indices if channel_indices is None else channel_indices
+    if not selected_indices:
+        raise IMSReaderError("At least one channel must be selected for the merge overlay.")
+    for channel_index in selected_indices:
         grayscale, record = rendered[channel_index]
         output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
         pseudocolor_images.append(apply_pseudocolor(grayscale, output_color))
@@ -223,7 +231,7 @@ def _export_rendered_single_channels(
     source_name = sanitize_filename_component(metadata.source_path.stem)
     output_format = _normalized_output_format(settings.output.format)
     results: list[ExportResult] = []
-    for channel_index in settings.channel_indices:
+    for channel_index in settings.resolved_single_channel_indices:
         adjusted, record = rendered[channel_index]
         if output_format == "png":
             output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
@@ -258,17 +266,23 @@ def _export_rendered_merge(
     settings: ExportSettings,
     rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
     output_directory: str | Path | None,
+    channel_indices: tuple[int, ...] | None = None,
 ) -> ExportResult:
     metadata = reader.metadata
     if metadata is None:
         raise IMSReaderError("Open the IMS file before exporting.")
-    merged, channel_records = merge_rendered_channels(rendered, settings)
+    merged, channel_records = merge_rendered_channels(rendered, settings, channel_indices)
     output_image, chosen_scale = prepare_output_image(merged, reader, settings)
     output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_name = sanitize_filename_component(metadata.source_path.stem)
     output_format = _normalized_output_format(settings.output.format)
-    output_path = _available_path(output_dir / f"{source_name}_Merge.{output_format}")
+    if channel_indices is None:
+        merge_name = "Merge"
+    else:
+        channel_names = "_".join(sanitize_filename_component(record.name) for record in channel_records)
+        merge_name = f"Merge_{channel_names}"
+    output_path = _available_path(output_dir / f"{source_name}_{merge_name}.{output_format}")
     _write_output_image(output_path, output_image, output_format, settings.output.dpi)
     return ExportResult(
         output_path,
@@ -276,6 +290,7 @@ def _export_rendered_merge(
         str(output_image.dtype),
         chosen_scale,
         channel_records,
+        output_kind="merge",
     )
 
 
@@ -356,9 +371,10 @@ def export_single_channels(
 ) -> list[ExportResult]:
     """Export channels as grayscale TIFF or RGB pseudocolor PNG images."""
 
-    if not settings.channel_indices:
-        raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_adjustments)
+    single_indices = settings.resolved_single_channel_indices
+    if not single_indices:
+        raise IMSReaderError("At least one single-channel output must be selected.")
+    rendered = render_selected_channels(reader, settings, display_adjustments, single_indices)
     return _export_rendered_single_channels(reader, settings, rendered, output_directory)
 
 
@@ -370,7 +386,10 @@ def export_merge(
 ) -> ExportResult:
     """Export selected channels as an additive, 8-bit RGB pseudocolor image."""
 
-    rendered = render_selected_channels(reader, settings, display_adjustments)
+    merge_indices = settings.resolved_merge_channel_indices
+    if not merge_indices:
+        raise IMSReaderError("At least one channel must be selected for the merge overlay.")
+    rendered = render_selected_channels(reader, settings, display_adjustments, merge_indices)
     return _export_rendered_merge(reader, settings, rendered, output_directory)
 
 
@@ -382,11 +401,24 @@ def export_channels_and_merge(
 ) -> list[ExportResult]:
     """Export individual channels and a merge while projecting each channel once."""
 
-    if not settings.channel_indices:
-        raise IMSReaderError("At least one channel must be selected.")
-    rendered = render_selected_channels(reader, settings, display_adjustments)
-    results = _export_rendered_single_channels(reader, settings, rendered, output_directory)
-    results.append(_export_rendered_merge(reader, settings, rendered, output_directory))
+    required_indices = settings.required_output_channel_indices
+    if not required_indices:
+        raise IMSReaderError("Select at least one single-channel or merge-overlay output.")
+    rendered = render_selected_channels(reader, settings, display_adjustments, required_indices)
+    results: list[ExportResult] = []
+    if settings.resolved_single_channel_indices:
+        results.extend(_export_rendered_single_channels(reader, settings, rendered, output_directory))
+    explicit_groups = settings.merge_channel_groups is not None
+    for group in settings.resolved_merge_channel_groups:
+        results.append(
+            _export_rendered_merge(
+                reader,
+                settings,
+                rendered,
+                output_directory,
+                channel_indices=group if explicit_groups else None,
+            )
+        )
     return results
 
 
@@ -405,10 +437,12 @@ def write_export_info(
         raise IMSReaderError("No image results are available for export metadata.")
     output_dir = Path(output_directory) if output_directory else default_output_directory(metadata.source_path)
     output_dir.mkdir(parents=True, exist_ok=True)
-    channel_records = next(
-        (result.channel_records for result in results if len(result.channel_records) > 1),
-        tuple(record for result in results for record in result.channel_records),
-    )
+    unique_channel_records: dict[int, ChannelExportRecord] = {}
+    for result in results:
+        for record in result.channel_records:
+            if record.index not in unique_channel_records or result.output_kind == "merge":
+                unique_channel_records[record.index] = record
+    channel_records = tuple(unique_channel_records.values())
     scale_bar_um = next((result.scale_bar_um for result in results if result.scale_bar_um is not None), None)
     channel_info = [
         {
@@ -442,6 +476,9 @@ def write_export_info(
         "output_height_px": settings.output.height_px,
         "output_dpi": settings.output.dpi,
         "resize_mode": settings.output.resize_mode,
+        "single_channel_indices": list(settings.resolved_single_channel_indices),
+        "merge_channel_indices": list(settings.resolved_merge_channel_indices),
+        "merge_channel_groups": [list(group) for group in settings.resolved_merge_channel_groups],
         "acquisition": {
             "recording_date": (
                 metadata.acquisition.recording_date.isoformat()
@@ -484,17 +521,19 @@ def _objective_result_payload(objective: ObjectiveDetectionResult) -> dict[str, 
         "confidence": objective.confidence,
         "detection_source": objective.detection_source,
         "warning": objective.warning,
+        "measured_fov_x_um": objective.measured_fov_x_um,
+        "measured_fov_y_um": objective.measured_fov_y_um,
+        "scan_zoom": objective.scan_zoom,
+        "normalized_fov_um": objective.normalized_fov_um,
+        "expected_fov_um": objective.expected_fov_um,
+        "xy_relative_error": objective.xy_relative_error,
     }
 
 
-def _summary_microscope(metadata: IMSMetadata) -> str:
-    manufacturer = metadata.acquisition.microscope_manufacturer
-    model = metadata.acquisition.microscope_model
-    if manufacturer and model:
-        if manufacturer.casefold() in model.casefold():
-            return model
-        return f"{manufacturer} {model}"
-    return manufacturer or model or "Not available"
+def _summary_microscope(_metadata: IMSMetadata) -> str:
+    """Use the laboratory microscope name requested for presentation summaries."""
+
+    return "Olympus FV1200"
 
 
 def _summary_objective(metadata: IMSMetadata, settings: ExportSettings) -> str:
@@ -520,15 +559,21 @@ def format_ppt_summary(metadata: IMSMetadata, settings: ExportSettings) -> str:
         if acquisition.scan_speed_us_per_pixel is not None
         else "Not available"
     )
-    selected_thickness = (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um
-    z_interval = selected.measured_z_spacing_um or metadata.voxel_size_z_um
+    if metadata.size_z == 1:
+        image_depth_description = "single-layer image;"
+    else:
+        selected_thickness = (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um
+        z_interval = selected.measured_z_spacing_um or metadata.voxel_size_z_um
+        image_depth_description = (
+            f"Z-sectioning interval: {_summary_number(z_interval)} μm, "
+            f"Z-stack thickness: {_summary_number(selected_thickness)} μm;"
+        )
     return (
         f"Date: {date}\n"
         f"Microscope: {_summary_microscope(metadata)}\n"
         f"Scan speed: {scan_speed}, Size: {metadata.size_x}×{metadata.size_y}\n"
         f"Objective lens: {_summary_objective(metadata, settings)}, "
-        f"Z-sectioning interval: {_summary_number(z_interval)} μm, "
-        f"Z-stack thickness: {_summary_number(selected_thickness)} μm;"
+        f"{image_depth_description}"
     )
 
 

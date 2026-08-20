@@ -41,6 +41,7 @@ class SettingsStore:
         saved_format = str(self.settings.value("export/format", "tif"))
         output_format = saved_format if saved_format in {"tif", "png"} else "tif"
         saved_directory = str(self.settings.value("export/output_directory", "")).strip()
+        last_input_directory = str(self.settings.value("input/last_directory", "")).strip()
         interval = self.settings.value("preview/refresh_interval_ms", 1000, type=int)
         if interval not in {500, 1000, 2000, 5000}:
             interval = 1000
@@ -58,6 +59,7 @@ class SettingsStore:
             ),
             gui=GuiPreferences(
                 output_directory=(Path(saved_directory) if saved_directory else None),
+                last_input_directory=(Path(last_input_directory) if last_input_directory else None),
                 copy_to_clipboard=self.settings.value("export/copy_to_clipboard", False, type=bool),
                 preview_refresh_interval_ms=interval,
                 section_expanded={
@@ -86,6 +88,10 @@ class SettingsStore:
 
     def save_refresh_interval(self, interval_ms: int) -> None:
         self.settings.setValue("preview/refresh_interval_ms", interval_ms)
+        self.settings.sync()
+
+    def save_last_input_directory(self, directory: Path) -> None:
+        self.settings.setValue("input/last_directory", str(directory))
         self.settings.sync()
 
     def save_section_expanded(self, section_key: str, expanded: bool) -> None:

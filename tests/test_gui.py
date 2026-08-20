@@ -8,11 +8,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 from PIL import Image
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication, QFileDialog, QTreeWidgetItem
+from PySide6.QtCore import QEvent, QPoint, QSettings, Qt
+from PySide6.QtGui import QAction, QCursor, QDesktopServices, QPixmap
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTreeWidgetItem
 
 from iea.gui import ExportImageSettingsDialog, ExportWorker, IMSFigureExporterWindow
+from iea.gui_controls import PersistentSelectionMenu
+from iea.gui_window import GITHUB_REPOSITORY_URL
 from iea.ims_reader import IMSReader
 from iea.models import ChannelSelection, ExportSettings, ScaleBarSettings
 
@@ -37,8 +40,19 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     window = IMSFigureExporterWindow(gui_settings)
     assert window.windowTitle() == "image_easy-to-adjust (IEA)"
     assert not window.windowIcon().isNull()
+    application_stylesheet = application.styleSheet()
+    assert "#2A2A2A" in application_stylesheet
+    assert "#3D3D3F" in application_stylesheet
+    assert "#232324" in application_stylesheet
+    assert application.palette().window().color().name() == "#2a2a2a"
+    assert "#F0B44D" in window.warning_label.styleSheet()
+    assert not window.warning_label.wordWrap()
+    assert window.centralWidget().layout().indexOf(window.warning_label) > window.centralWidget().layout().indexOf(
+        window.content_splitter
+    )
+    assert window.channels_group.isAncestorOf(window.red_to_magenta)
     menu_names = [action.text().replace("&", "") for action in window.menuBar().actions()]
-    assert menu_names == ["File", "Preview", "Batch", "Export"]
+    assert menu_names == ["File", "Preview", "Batch", "Output Images", "Export", "Help"]
     assert window.content_splitter.count() == 2
     assert window.content_splitter.handleWidth() == 7
     assert not window.content_splitter.isCollapsible(0)
@@ -47,11 +61,77 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     assert window.output_height_px == 1000
     assert window.output_dpi == 300
     assert window.output_resize_mode == "fit"
+    assert window.scale_thickness.value() == 10
+    assert window.scale_font_size.value() == 50
+    assert isinstance(window.output_images_menu, PersistentSelectionMenu)
     assert window.export_action.shortcut().toString() == "Ctrl+C"
     assert not window.export_button.isEnabled()
     assert set(window.collapsible_sections) == {"batch_files", "channels", "z_range", "objective", "scale_bar"}
     assert all(section.is_expanded for section in window.collapsible_sections.values())
     window.close()
+    assert application is not None
+
+
+def test_help_menu_opens_repository_and_shows_about_information(gui_settings, monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = IMSFigureExporterWindow(gui_settings)
+    opened_urls = []
+    about_calls = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened_urls.append(url.toString()) or True)
+    monkeypatch.setattr(QMessageBox, "about", lambda parent, title, text: about_calls.append((parent, title, text)))
+
+    window.github_action.trigger()
+    window.about_action.trigger()
+
+    assert opened_urls == [GITHUB_REPOSITORY_URL]
+    assert about_calls[0][0] is window
+    assert about_calls[0][1] == "About IEA"
+    assert "Song Xuanyu" in about_calls[0][2]
+    assert "Codex" in about_calls[0][2]
+    assert "simple batch processing of IMS files" in about_calls[0][2]
+    assert "author's own workflow needs" in about_calls[0][2]
+    assert "songxuanyuhappy@gmail.com" in about_calls[0][2]
+    assert "Version 0.3.0" in about_calls[0][2]
+    window.close()
+
+
+def test_metadata_warnings_are_shown_as_one_bottom_line(gui_settings):
+    QApplication.instance() or QApplication([])
+    window = IMSFigureExporterWindow(gui_settings)
+    window._update_warning_display(("First warning.\nExtra detail.", "Second warning."))
+
+    assert window.warning_label.text() == "First warning. Extra detail.    Second warning."
+    assert "\n" not in window.warning_label.text()
+    assert not window.warning_label.isHidden()
+    assert window.warning_label.toolTip() == window.warning_label.text()
+    window.close()
+
+
+def test_output_selection_menu_stays_open_for_checks_and_closes_after_pointer_leaves():
+    application = QApplication.instance() or QApplication([])
+    root_menu = PersistentSelectionMenu("Output Images")
+    submenu = root_menu.add_persistent_menu("Two-color Merge")
+    choice = QAction("Green + Red", submenu, checkable=True)
+    submenu.addAction(choice)
+
+    root_menu.popup(QPoint(10, 10))
+    submenu.popup(QPoint(150, 10))
+    application.processEvents()
+    QTest.mouseClick(
+        submenu,
+        Qt.MouseButton.LeftButton,
+        pos=submenu.actionGeometry(choice).center(),
+    )
+
+    assert choice.isChecked()
+    assert root_menu.isVisible()
+    assert submenu.isVisible()
+
+    QCursor.setPos(QPoint(10_000, 10_000))
+    submenu.leaveEvent(QEvent(QEvent.Type.Leave))
+    QTest.qWait(180)
+    assert not root_menu.isVisible()
+    submenu.close()
     assert application is not None
 
 
@@ -76,6 +156,8 @@ def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui
     window = IMSFigureExporterWindow(gui_settings)
     window.metadata = metadata
     window._populate_channels(metadata)
+    assert window.channel_rows_layout.count() == metadata.channel_count
+    assert window.channels_group.isAncestorOf(window.red_to_magenta)
     green_controls = window.channel_controls[0]
     assert green_controls.minimum.value() == 0.0
     assert green_controls.maximum.value() == 20.0
@@ -83,6 +165,9 @@ def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui
     assert green_controls.minimum_slider.orientation() == Qt.Orientation.Horizontal
     assert green_controls.maximum_slider.orientation() == Qt.Orientation.Horizontal
     assert green_controls.gamma_slider.orientation() == Qt.Orientation.Horizontal
+    assert window.output_image_actions[(0,)].isChecked()
+    assert window.output_image_actions[(1,)].isChecked()
+    assert window.output_image_actions[(0, 1)].isChecked()
     window.refresh_limit_actions[2000].trigger()
     green_controls.gamma_slider.setValue(green_controls.gamma_slider.maximum())
 
@@ -91,6 +176,53 @@ def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui
     assert window._preview_timer.interval() == 2000
     assert green_controls.gamma.value() == 5.0
     assert window._display_adjustments()[0].gamma == 5.0
+
+    window.output_image_actions[(0,)].setChecked(False)
+    window.red_to_magenta.setChecked(False)
+    settings = window._current_settings()
+    selections = window._channel_selections()
+    assert settings is not None
+    assert not settings.red_to_magenta
+    assert settings.resolved_single_channel_indices == (1,)
+    assert settings.resolved_merge_channel_groups == ((0, 1),)
+    assert not selections[0].export_single
+    assert selections[0].include_in_merge
+    assert selections[1].export_single
+    assert selections[1].include_in_merge
+
+    window._preview_timer.stop()
+    window.close()
+    assert application is not None
+
+
+def test_output_images_menu_selects_multiple_single_and_merge_outputs(
+    sample_three_channel_ims,
+    gui_settings,
+):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_three_channel_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+
+    submenu_names = [action.text() for action in window.output_images_menu.actions() if action.menu() is not None]
+    assert submenu_names == ["Three-color Merge", "Two-color Merge", "Single-color"]
+    assert len(window.output_image_actions) == 7
+    assert len(window._selected_output_groups()) == 4
+
+    window._set_all_output_actions(False)
+    for group in ((1, 2), (0, 1), (0, 1, 2), (0,)):
+        window.output_image_actions[group].setChecked(True)
+    settings = window._current_settings()
+
+    assert settings is not None
+    assert settings.resolved_single_channel_indices == (0,)
+    assert set(settings.resolved_merge_channel_groups) == {(1, 2), (0, 1), (0, 1, 2)}
+    assert len(settings.required_output_channel_indices) == 3
+    assert window.preview_combo.count() == 6
 
     window._preview_timer.stop()
     window.close()
@@ -117,6 +249,8 @@ def test_objective_auto_detection_and_manual_override_reach_export_settings(samp
 
     assert "Selected: 60X — UPLSAPO60XS" in window.objective_details.text()
     assert "Detection: Manual selection" in window.objective_details.text()
+    assert "XY FOV:" in window.objective_details.text()
+    assert "normalized" in window.objective_details.text()
     assert settings is not None
     assert settings.objective_override == "60X"
     window._preview_timer.stop()
@@ -280,6 +414,39 @@ def test_open_multiple_files_defaults_to_process_and_export_all(sample_ims, tmp_
     assert first_item.checkState(1) == Qt.CheckState.Checked
     assert len(window._selected_export_paths()) == 2
     window.close()
+    assert application is not None
+
+
+def test_open_ims_dialog_remembers_last_successful_folder(sample_ims, tmp_path, monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    settings_path = tmp_path / "last-input.ini"
+    first = IMSFigureExporterWindow(QSettings(str(settings_path), QSettings.Format.IniFormat))
+    monkeypatch.setattr(first, "update_preview", lambda: None)
+    first_calls = []
+
+    def choose_first(*args):
+        first_calls.append(args)
+        return [str(sample_ims)], "IMS files"
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileNames", choose_first)
+    first.open_ims()
+
+    assert first_calls[0][2] == ""
+    assert first.last_input_directory == sample_ims.parent
+    first.close()
+
+    second = IMSFigureExporterWindow(QSettings(str(settings_path), QSettings.Format.IniFormat))
+    second_calls = []
+
+    def choose_second(*args):
+        second_calls.append(args)
+        return [], "IMS files"
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileNames", choose_second)
+    second.open_ims()
+
+    assert second_calls[0][2] == str(sample_ims.parent)
+    second.close()
     assert application is not None
 
 

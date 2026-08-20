@@ -29,12 +29,18 @@ class IMSReaderError(RuntimeError):
 
 FALLBACK_COLORS: tuple[tuple[float, float, float], ...] = (
     (0.0, 1.0, 0.0),
-    (1.0, 0.0, 1.0),
+    (1.0, 0.0, 0.0),
     (0.0, 0.0, 1.0),
     (0.0, 1.0, 1.0),
     (1.0, 1.0, 0.0),
     (1.0, 1.0, 1.0),
 )
+
+KNOWN_CHANNEL_COLORS: dict[str, tuple[float, float, float]] = {
+    "alexa fluor 488": (0.0, 1.0, 0.0),
+    "alexa fluor 594": (1.0, 0.0, 0.0),
+    "draq5": (0.0, 0.0, 1.0),
+}
 
 
 def _natural_key(name: str) -> tuple[Any, ...]:
@@ -483,7 +489,15 @@ class IMSReader:
                 color_array /= 255.0
             color = tuple(float(value) for value in np.clip(color_array, 0.0, 1.0))
         else:
-            color = FALLBACK_COLORS[index % len(FALLBACK_COLORS)]
+            normalized_name = " ".join(name.casefold().split())
+            color = next(
+                (
+                    known_color
+                    for known_name, known_color in KNOWN_CHANNEL_COLORS.items()
+                    if known_name in normalized_name
+                ),
+                FALLBACK_COLORS[index % len(FALLBACK_COLORS)],
+            )
             warnings.append(f"Color missing for {name}; fallback color {color} is used.")
 
         range_values = parse_number_list(get_attribute(attrs, "ColorRange"))

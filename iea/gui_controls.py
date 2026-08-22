@@ -2,9 +2,66 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QCursor, QEnterEvent, QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QFrame, QLayout, QMenu, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QCursor, QEnterEvent, QKeyEvent, QMouseEvent, QWheelEvent
+from PySide6.QtWidgets import QFrame, QLabel, QLayout, QMenu, QToolButton, QVBoxLayout, QWidget
+
+
+class InteractivePreviewLabel(QLabel):
+    """Image surface with mouse gestures, leaving the actual transform to its parent."""
+
+    pan_requested = Signal(int, int)
+    rotation_requested = Signal(float)
+    zoom_requested = Signal(float)
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._drag_position: QPoint | None = None
+        self._drag_button = Qt.MouseButton.NoButton
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            self._drag_position = event.position().toPoint()
+            self._drag_button = event.button()
+            self.setCursor(
+                Qt.CursorShape.ClosedHandCursor
+                if event.button() == Qt.MouseButton.LeftButton
+                else Qt.CursorShape.SizeAllCursor
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_position is None:
+            super().mouseMoveEvent(event)
+            return
+        current = event.position().toPoint()
+        delta = current - self._drag_position
+        self._drag_position = current
+        if self._drag_button == Qt.MouseButton.LeftButton:
+            self.pan_requested.emit(delta.x(), delta.y())
+        elif self._drag_button == Qt.MouseButton.RightButton:
+            self.rotation_requested.emit((delta.x() - delta.y()) * 0.35)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == self._drag_button:
+            self._drag_position = None
+            self._drag_button = Qt.MouseButton.NoButton
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        steps = event.angleDelta().y() / 120.0
+        if steps:
+            self.zoom_requested.emit(1.25**steps)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
 
 class PersistentSelectionMenu(QMenu):

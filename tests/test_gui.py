@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,13 +12,20 @@ from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QSettings, Qt
 from PySide6.QtGui import QAction, QCursor, QDesktopServices, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTreeWidgetItem, QWidget
 
-from iea.gui import DatasetOpenWorker, ExportImageSettingsDialog, ExportWorker, IMSFigureExporterWindow
+from iea.gui import (
+    CellCountingDemoDialog,
+    DatasetOpenWorker,
+    ExportImageSettingsDialog,
+    ExportWorker,
+    IMSFigureExporterWindow,
+)
 from iea.gui_controls import PersistentSelectionMenu
 from iea.gui_window import AUTO_MERGE_PREVIEW, GITHUB_REPOSITORY_URL
 from iea.ims_reader import IMSReader
 from iea.models import ChannelSelection, ExportSettings, ScaleBarSettings
+from iea.plugins.cell_counting import load_cell_counting_plugins
 
 
 @pytest.fixture
@@ -52,7 +60,7 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     )
     assert window.channels_group.isAncestorOf(window.red_to_magenta)
     menu_names = [action.text().replace("&", "") for action in window.menuBar().actions()]
-    assert menu_names == ["File", "Preview", "Batch", "Output Images", "Export", "Help"]
+    assert menu_names == ["File", "Preview", "Batch", "Output Images", "Analysis", "Export", "Help"]
     assert window.content_splitter.count() == 2
     assert window.content_splitter.handleWidth() == 7
     assert not window.content_splitter.isCollapsible(0)
@@ -65,6 +73,10 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     assert window.scale_font_size.value() == 50
     assert isinstance(window.output_images_menu, PersistentSelectionMenu)
     assert window.export_action.shortcut().toString() == "Ctrl+C"
+    assert window.reset_preview_view_action.shortcut().toString() == "Ctrl+B"
+    assert not window.cell_count_demo_action.isEnabled()
+    assert not window.send_to_fiji_action.isEnabled()
+    assert window.configure_fiji_action.isEnabled()
     assert not window.export_button.isEnabled()
     assert set(window.collapsible_sections) == {"batch_files", "channels", "z_range", "objective", "scale_bar"}
     assert all(section.is_expanded for section in window.collapsible_sections.values())
@@ -145,6 +157,85 @@ def test_preview_zoom_changes_display_but_not_source_pixmap(gui_settings):
     assert window.preview_label.pixmap().size().height() == 160
     assert window.preview_pixmap.size() == original_size
     window.close()
+
+
+def test_preview_pan_rotate_and_zoom_are_view_only(gui_settings):
+    application = QApplication.instance() or QApplication([])
+    window = IMSFigureExporterWindow(gui_settings)
+    window.resize(700, 500)
+    window.show()
+    window.preview_pixmap = QPixmap(1000, 800)
+    window.preview_full_size = (1000, 800)
+    window._set_preview_zoom(1.5)
+    application.processEvents()
+    horizontal = window.preview_scroll.horizontalScrollBar()
+    vertical = window.preview_scroll.verticalScrollBar()
+    horizontal.setValue(min(100, horizontal.maximum()))
+    vertical.setValue(min(80, vertical.maximum()))
+    old_scroll = (horizontal.value(), vertical.value())
+
+    window._pan_preview(20, 15)
+    assert horizontal.value() <= old_scroll[0]
+    assert vertical.value() <= old_scroll[1]
+    window._rotate_preview(30.0)
+    window._zoom_preview_by_factor(1.25)
+
+    assert window.preview_rotation_degrees == 30.0
+    assert window.preview_zoom == pytest.approx(1.875)
+    assert window.preview_pixmap.size().width() == 1000
+    assert window.preview_pixmap.size().height() == 800
+    window.reset_rotation_button.click()
+    assert window.preview_rotation_degrees == 0.0
+    window._set_preview_zoom(2.0)
+    window._rotate_preview(45.0)
+    window.reset_preview_view_action.trigger()
+    assert window.preview_zoom == 1.0
+    assert window.preview_rotation_degrees == 0.0
+    assert window.status_label.text() == "Preview view reset to 100% and 0°."
+    window.close()
+    assert application is not None
+
+
+def test_cell_counting_dialog_suggests_nuclear_channel_and_builds_manual_roi(
+    sample_three_channel_ims,
+):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_three_channel_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+    channels = tuple(
+        replace(channel, name="DRAQ5") if channel.index == 2 else channel
+        for channel in metadata.channels
+    )
+    metadata = replace(metadata, channels=channels)
+    parent = QWidget()
+    dialog = CellCountingDemoDialog(
+        parent,
+        metadata,
+        load_cell_counting_plugins(),
+        1,
+        metadata.size_z,
+        QPixmap(500, 400),
+        (1000, 1000),
+        "stretch",
+    )
+
+    assert dialog.detection_checks[2].isChecked()
+    assert not dialog.detection_checks[0].isChecked()
+    assert all(check.isChecked() for check in dialog.measurement_checks.values())
+    dialog.roi_mode_combo.setCurrentIndex(dialog.roi_mode_combo.findData("manual"))
+    dialog._preview_roi_changed(0.1, 0.2, 0.3, 0.4)
+    request = dialog.request()
+
+    assert request.roi_mode == "manual"
+    assert request.detection_channel_indices == (2,)
+    assert request.measurement_channel_indices == (0, 1, 2)
+    assert request.manual_roi.x == pytest.approx(0.1)
+    assert request.manual_roi.y == pytest.approx(0.2)
+    assert request.manual_roi.width == pytest.approx(0.3)
+    assert request.manual_roi.height == pytest.approx(0.4)
+    dialog.close()
+    assert application is not None
 
 
 def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui_settings):
@@ -386,6 +477,8 @@ def test_menu_settings_persist_between_windows(tmp_path):
     first.output_resize_mode = "crop"
     first.copy_to_clipboard = True
     first.output_directory = tmp_path / "saved-output"
+    first.fiji_directory = tmp_path / "Fiji.app"
+    first.settings_store.save_fiji_directory(first.fiji_directory)
     first._save_export_settings()
     first.refresh_limit_actions[5000].trigger()
     first.close()
@@ -399,6 +492,7 @@ def test_menu_settings_persist_between_windows(tmp_path):
     assert second.output_resize_mode == "crop"
     assert second.copy_to_clipboard
     assert second.output_directory == tmp_path / "saved-output"
+    assert second.fiji_directory == tmp_path / "Fiji.app"
     assert second.preview_refresh_interval_ms == 5000
     assert second.refresh_limit_actions[5000].isChecked()
     second.close()

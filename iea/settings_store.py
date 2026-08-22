@@ -94,6 +94,14 @@ class SettingsStore:
         self.settings.setValue("input/last_directory", str(directory))
         self.settings.sync()
 
+    def load_fiji_directory(self) -> Path | None:
+        saved = str(self.settings.value("integration/fiji_directory", "")).strip()
+        return Path(saved) if saved else None
+
+    def save_fiji_directory(self, directory: Path) -> None:
+        self.settings.setValue("integration/fiji_directory", str(directory))
+        self.settings.sync()
+
     def save_section_expanded(self, section_key: str, expanded: bool) -> None:
         if section_key not in SECTION_KEYS:
             raise ValueError(f"Unknown collapsible section: {section_key}")

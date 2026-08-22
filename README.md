@@ -135,7 +135,7 @@ sample_Export/
 
 ## 当前限制
 
-- 只使用 `ResolutionLevel 0` 和 `TimePoint 0`；多时间点文件会显示警告。
+- 导出始终使用 `ResolutionLevel 0`；交互预览会按屏幕实际像素需求自动选择 IMS 金字塔层级。当前仍只使用 `TimePoint 0`，多时间点文件会显示警告。
 - OIB 初版使用第一个 Bio-Formats scene；多 scene 文件会显示警告。
 - OIB 转 IMS 目前只接受官方 PyImarisWriter 原生支持的 `uint8`、`uint16` 和 `float32`；其他类型不会被静默转换或归一化。
 - 多层 OIB 如果缺少可靠的 PhysicalSizeZ，或任何 OIB 缺少 PhysicalSizeX/Y，将停止创建科学尺度不可靠的 IMS；缺失 metadata 保持为 `None`，不会猜测。
@@ -171,13 +171,29 @@ Windows 下推荐双击项目目录中的 `image_easy-to-adjust.lnk` 启动；�
 
 当 IMS 没有记录通道颜色时，程序会识别常用染料名称：`Alexa Fluor 488` 使用绿色、`Alexa Fluor 594` 使用红色、`DRAQ5` 使用蓝色。`Channels` 模块底部的 `Convert red to magenta` 开启时，会把红色通道转换为品红色，并同时作用于预览和导出；关闭后保持原始红色。IMS 读取警告显示在窗口左下方，并用四个空格连接为单行，鼠标悬停时也可查看完整内容。
 
-预览默认使用 `Merge: Selected Channels`，并始终跟随 `Channels` 中当前勾选的通道：三个通道显示三色 Merge，两个通道显示对应双色 Merge，只剩一个通道时仍显示该通道的伪彩色图像而不是灰度图。该默认预览独立于 `Output Images` 导出清单；预览区还提供“−”“+”“100%”和“Fit”按钮，可缩小、放大、按原始预览尺寸显示或适应窗口。这里的缩放只改变屏幕显示，不会改变最终导出的像素尺寸和图像内容。
+预览默认使用 `Merge: Selected Channels`，并始终跟随 `Channels` 中当前勾选的通道：三个通道显示三色 Merge，两个通道显示对应双色 Merge，只剩一个通道时仍显示该通道的伪彩色图像而不是灰度图。该默认预览独立于 `Output Images` 导出清单。预览渲染器会读取 IMS 中可用的 `ResolutionLevel`：适应窗口或缩小时使用足以覆盖屏幕像素的较低层级，放大后自动切换到更高层级，避免把低分辨率缩略图机械放大。预览区提供“−”“+”“100%”“Fit”和“0°”按钮；鼠标滚轮用于缩放，左键拖动用于平移，右键拖动用于二维旋转，“0°”用于重置旋转。按 `Ctrl+B` 可一次恢复到 100%、0° 并重新居中。状态栏和缩放标签会显示当前层级。所有这些视图变换都只影响屏幕查看，不会改变最终导出的像素尺寸、方向或图像内容。
 
 左侧参数区域和右侧 Preview 区域之间有一条竖向分隔线。按住分隔线并左右拖动，可以随时调整两部分的宽度占比；两侧都设有最小宽度，不会被意外完全折叠。
 
 左侧的 `Batch Files`、`Channels`、`Z Range` 和 `Scale Bar` 都是可折叠分组。点击分组标题或标题旁的箭头即可展开或收起；每个分组的状态会立即保存，关闭并重新打开软件后仍保持上次的展开状态。
 
 修改通道、Z 范围、显示范围、颜色或比例尺等参数后，预览会自动刷新。菜单栏的 `Preview > Refresh Limit` 子菜单用于限制刷新频率，可选择每秒最多 2 次、每秒最多 1 次、每 2 秒一次或每 5 秒一次；默认每秒最多 1 次。短时间内连续修改多个参数时，程序会合并这些变化，避免同时启动多个预览计算。
+
+### Cell Counting Plugin Demo
+
+打开显微镜文件后，可从 `Analysis > Cell Counting Plugin Demo` 启动计数 Demo。它采用“分割一次、测量多通道”的工作流：检测通道用于生成一张整数标签图，`0` 是背景，`1、2、3…` 分别代表细胞；随后在同一批细胞区域内测量所有勾选通道的归一化平均/最大强度，并按平均强度阈值给出每个通道的阳性数量和阳性率。程序会优先把名称含 `DRAQ`、`DAPI`、`Hoechst`、`Nucleus`、`Nuclei` 或 `DNA` 的通道自动选作检测通道，也允许手动选择一个或多个检测输入通道。
+
+ROI 支持 `Full image`、`Automatic foreground rectangle` 和 `Manual rectangle`。手动模式既可填写相对原图的 X/Y/Width/Height 百分比，也可直接在对话框中的预览图上按住左键拖画矩形；ROI 最终以相对原图坐标保存并用于 Level 0 数据。结果窗口提供青色细胞边界、黄色中心点、橙色 ROI、通道汇总和逐细胞结果，并可导出带 UTF-8 BOM 的 CSV，方便 Excel 打开。
+
+当前内置的 `Threshold + connected components (Demo)` 使用 Otsu/手动阈值、简单形态清理、连通域和面积过滤，不会可靠拆分互相接触的细胞，因此必须检查 Overlay，尚不能代替经过验证的科研分析流程。插件接口要求分割器返回与 Cellpose 相同语义的整数 label image；以后接入 Cellpose 时，只需增加新的 `iea.cell_counting` entry point，ROI、通道测量、阳性分类、表格和 CSV 不需要重写。
+
+### Fiji Bridge
+
+`Analysis > Fiji Bridge > Open Selected Data in Fiji` 会把当前文件、`Channels` 中勾选的原始通道和当前 Z 范围流式写入临时 OME-TIFF，再交给独立的 Fiji 进程打开。通道名称、X/Y 像素尺寸和 Z 间距会写入 OME metadata；IEA 的 Display Min/Max/Gamma 不会烧入原始强度。这样可以在 Fiji 中使用其完整菜单、ROI 工具和已安装插件，同时避免 Fiji 的 Java/Swing 环境干扰 IEA 读取 OIB 所使用的 Java 进程。
+
+IEA 会记住 Fiji 安装目录，并会自动检查用户目录及 Windows 各磁盘下的 `Fiji/Fiji.app`。如果没有找到，或以后移动了 Fiji，请使用 `Analysis > Fiji Bridge > Configure Fiji Installation`，选择包含 `fiji-windows-x64.exe` 的 `Fiji.app` 文件夹。桥接文件保存在系统临时目录的 `image_easy-to-adjust/fiji-bridge` 子目录；它是分析用副本，不会修改原始 IMS/OIB。
+
+基础桥接不需要另装 Fiji 插件。安装其他插件时，优先在 Fiji 中选择 `Help > Update… > Manage update sites`，勾选插件要求的 update site，关闭列表后选择 `Apply changes` 并重启 Fiji。没有 update site 的 `.jar` 插件可以使用 `Plugins > Install Plugin…`，或复制到 `Fiji.app/plugins` 后重启。IEA 目前负责把数据交给 Fiji；在 Fiji 中保存的结果不会自动覆盖或导回 IEA。
 
 菜单栏的 `File > Open Microscopy Files` 可一次选择一个或多个 IMS/OIB 文件。程序会记住最近一次成功打开显微镜文件的文件夹，下次打开文件选择窗口时从该文件夹开始；如果文件夹已不存在，则使用系统默认位置。文件会显示在左侧 `Batch Files` 列表中，当前选中行用于 Preview；自动预览只计算这一张，避免批量文件同时刷新。每个文件的 `Process` 和 `Export` 默认都勾选：取消 `Process` 会同时取消导出，重新勾选 `Export` 会自动恢复 `Process`。`Batch` 菜单可批量全选或清空这两列。当前界面参数会统一应用到所有最终勾选导出的文件；文件的 Z 层数较少时，程序会自动限制到该文件的有效范围。
 
@@ -223,6 +239,8 @@ iea/
   gui_window.py       主窗口和界面交互
   gui_dialogs.py      设置对话框
   gui_workers.py      后台预览与导出任务
+  plugins/
+    cell_counting/    可替换的细胞分割插件接口、注册表与阈值 Demo
   settings_store.py   GUI 设置的读取和保存
   batch.py            批量文件的通道匹配
   fv1200_calibration.py  FV1200 固定物镜 calibration profile

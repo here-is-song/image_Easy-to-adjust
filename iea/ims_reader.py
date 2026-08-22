@@ -12,6 +12,7 @@ from typing import Any
 import h5py
 import numpy as np
 
+from .image_dataset import ResolutionLevelInfo
 from .metadata import (
     get_attribute,
     normalize_attribute,
@@ -595,6 +596,124 @@ class IMSReader:
         selected = np.asarray(data[tuple(selection)])
         transpose_axes = tuple(channel.axis_order.index(axis) for axis in ("Z", "Y", "X"))
         return np.transpose(selected, axes=transpose_axes)
+
+    def resolution_levels(self) -> tuple[ResolutionLevelInfo, ...]:
+        """Describe every readable IMS pyramid level without loading its pixels."""
+
+        metadata = self.metadata
+        h5_file = self._require_file()
+        if metadata is None:
+            raise IMSReaderError("IMS metadata has not been parsed.")
+        dataset_root = _child_casefold(h5_file, "DataSet")
+        if not isinstance(dataset_root, h5py.Group):
+            return ()
+        levels: list[ResolutionLevelInfo] = []
+        for level_group in _indexed_groups(dataset_root, "ResolutionLevel "):
+            level_index = int(level_group.name.rsplit(" ", 1)[-1])
+            time_point = _child_casefold(level_group, "TimePoint 0")
+            if not isinstance(time_point, h5py.Group):
+                continue
+            channel_group = _child_casefold(time_point, "Channel 0")
+            if not isinstance(channel_group, h5py.Group):
+                continue
+            data = self._find_data_dataset(channel_group)
+            channel = metadata.channels[0]
+            stored_sizes = {
+                axis: parse_int(get_attribute(channel_group.attrs, f"ImageSize{axis}"))
+                for axis in ("X", "Y", "Z")
+            }
+            sizes = {
+                axis: stored_sizes[axis] or int(data.shape[channel.axis_order.index(axis)])
+                for axis in ("X", "Y", "Z")
+            }
+            levels.append(
+                ResolutionLevelInfo(
+                    level_index,
+                    sizes["X"],
+                    sizes["Y"],
+                    sizes["Z"],
+                )
+            )
+        return tuple(sorted(levels, key=lambda level: level.index))
+
+    def project_z_range_at_resolution(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        resolution_level: int,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]:
+        """Calculate a MIP directly from one native IMS pyramid level."""
+
+        metadata = self.metadata
+        h5_file = self._require_file()
+        if metadata is None:
+            raise IMSReaderError("IMS metadata has not been parsed.")
+        if not 0 <= channel_index < metadata.channel_count:
+            raise IMSReaderError(f"Channel index {channel_index} is out of range.")
+        if not 1 <= z_start <= z_end <= metadata.size_z:
+            raise IMSReaderError(
+                f"Z range must satisfy 1 <= start <= end <= {metadata.size_z}; received {z_start}..{z_end}."
+            )
+        if chunk_depth <= 0:
+            raise IMSReaderError("Projection chunk depth must be greater than zero.")
+
+        levels = {level.index: level for level in self.resolution_levels()}
+        level = levels.get(resolution_level)
+        if level is None:
+            raise IMSReaderError(f"ResolutionLevel {resolution_level} was not found.")
+        dataset_root = _child_casefold(h5_file, "DataSet")
+        level_group = (
+            _child_casefold(dataset_root, f"ResolutionLevel {resolution_level}")
+            if isinstance(dataset_root, h5py.Group)
+            else None
+        )
+        time_point = (
+            _child_casefold(level_group, "TimePoint 0")
+            if isinstance(level_group, h5py.Group)
+            else None
+        )
+        channel_group = (
+            _child_casefold(time_point, f"Channel {channel_index}")
+            if isinstance(time_point, h5py.Group)
+            else None
+        )
+        if not isinstance(channel_group, h5py.Group):
+            raise IMSReaderError(
+                f"ResolutionLevel {resolution_level} does not contain Channel {channel_index}."
+            )
+        data = self._find_data_dataset(channel_group)
+        channel = metadata.channels[channel_index]
+        z_axis = channel.axis_order.index("Z")
+        transpose_axes = tuple(channel.axis_order.index(axis) for axis in ("Z", "Y", "X"))
+        level_z_start = int(np.floor((z_start - 1) * level.size_z / metadata.size_z))
+        level_z_end = int(np.ceil(z_end * level.size_z / metadata.size_z))
+        level_z_start = min(max(level_z_start, 0), level.size_z - 1)
+        level_z_end = min(max(level_z_end, level_z_start + 1), level.size_z)
+        logical_sizes = {"X": level.size_x, "Y": level.size_y, "Z": level.size_z}
+        projection: np.ndarray | None = None
+        data_min: float | None = None
+        data_max: float | None = None
+        level_chunk_depth = max(1, round(chunk_depth * level.size_z / metadata.size_z))
+        for chunk_start in range(level_z_start, level_z_end, level_chunk_depth):
+            chunk_end = min(chunk_start + level_chunk_depth, level_z_end)
+            selection = [slice(0, logical_sizes[axis]) for axis in channel.axis_order]
+            selection[z_axis] = slice(chunk_start, chunk_end)
+            selected = np.asarray(data[tuple(selection)])
+            chunk_zyx = np.transpose(selected, axes=transpose_axes)
+            chunk_projection = np.max(chunk_zyx, axis=0)
+            if projection is None:
+                projection = chunk_projection.copy()
+            else:
+                np.maximum(projection, chunk_projection, out=projection)
+            chunk_minimum = float(np.min(chunk_zyx))
+            chunk_maximum = float(np.max(chunk_zyx))
+            data_min = chunk_minimum if data_min is None else min(data_min, chunk_minimum)
+            data_max = chunk_maximum if data_max is None else max(data_max, chunk_maximum)
+        if projection is None or data_min is None or data_max is None:
+            raise IMSReaderError("The selected Z range did not contain image data.")
+        return projection, data_min, data_max
 
     def project_z_range(
         self,

@@ -11,6 +11,17 @@
 - 新增逐通道 Imaris-like Auto Display：第一个显著 histogram mode、P99.8 和 Gamma 1.0，采用有上限的 Z/XY 采样且不修改原始 voxel。
 - 接入官方 PyImarisWriter，以分块方式写入原始像素、物理尺度、通道名称/颜色及 Min/Max/Gamma；临时文件完成后再原子重命名。
 - OIB 转换使用 GUI 后台 worker，支持批量选择、进度显示、取消和安全错误清理。
+- 新增 IMS 多分辨率预览；缩放时会根据屏幕像素需求自动选择合适的 `ResolutionLevel`。
+- 新增预览鼠标交互：滚轮缩放、左键拖动平移、右键拖动二维旋转，以及 `Ctrl+B` 恢复正常大小和角度。
+- 新增可扩展的细胞计数插件接口和 `Threshold + connected components (Demo)`，支持多检测/测量通道、全图/自动/手动画框 ROI、细胞标签 Overlay、阳性统计和 CSV 导出，并为后续 Cellpose 插件复用统一 label image 约定。
+- 新增外部 Fiji Bridge：将当前勾选通道和 Z 范围流式导出为保留原始强度与物理标定的 OME-TIFF，再由独立 Fiji 进程打开。
+- Fiji Bridge 支持自动发现及记忆 Fiji 安装目录、后台进度和安全取消；无需把 Fiji 移入项目或与 IEA 共用 Java 进程。
+
+### 界面与交互改进
+
+- 预览状态会显示实际使用的金字塔层级；屏幕缩放、平移和旋转不会改变最终导出内容。
+- `Analysis` 菜单新增细胞计数 Demo 和 Fiji Bridge，Fiji 安装位置可在菜单中重新指定。
+- 细胞计数结果窗口同时显示细胞边界、中心点、ROI、各通道阳性汇总和逐细胞测量结果。
 
 ### 安全与兼容性
 
@@ -25,6 +36,11 @@
 - 修复 Windows 项目路径包含中文时，JPype 本地库无法被 JVM 加载的问题；仅将 Java bridge 镜像到 ASCII 临时目录，原始 OIB 不移动。
 - 修复 Bio-Formats JVM 与 PyImarisWriter 多线程同时存在时，单层 OIB 可能长期停留在 IMS finalize 的问题；缓存 writer 默认使用稳定的单线程模式。
 - 预览默认使用当前启用通道的彩色 Merge；调整 Channels 后会自动切换为对应三色、双色或单通道伪彩色预览，不再意外退回灰度图。
+
+### 验证
+
+- 使用真实三通道 IMS 样本验证 Fiji OME-TIFF 桥接、通道顺序和物理标定。
+- 自动化测试扩展至 101 项，全部通过。
 
 ## v0.3.0 - 2026-08-20
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -22,10 +21,22 @@ from .exporter import (
     write_export_info,
     write_ppt_summary,
 )
+from .fiji_bridge import (
+    FijiBridgeCancelled,
+    FijiBridgeResult,
+    export_dataset_to_ome_tiff,
+    launch_fiji,
+    make_bridge_output_path,
+)
+from .image_dataset import ImageDataset, ResolutionLevelInfo
 from .ims_reader import IMSReaderError
 from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings, IMSMetadata
-
-PREVIEW_MAX_EDGE = 1200
+from .plugins.cell_counting import (
+    CellCountingRequest,
+    CellCountingResult,
+    CellSegmenterPlugin,
+    run_cell_counting,
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,22 @@ class DatasetOpenRecord:
 class DatasetOpenOutcome:
     records: tuple[DatasetOpenRecord, ...]
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreviewRenderResult:
+    """Rendered preview plus the pyramid level used to produce it."""
+
+    image: np.ndarray
+    full_size: tuple[int, int]
+    level: ResolutionLevelInfo
+    available_levels: tuple[ResolutionLevelInfo, ...]
+
+
+@dataclass(frozen=True)
+class FijiBridgeOutcome:
+    result: FijiBridgeResult | None
+    cancelled: bool = False
 
 
 class DatasetOpenWorker(QObject):
@@ -111,12 +138,28 @@ class DatasetOpenWorker(QObject):
         self.finished.emit(DatasetOpenOutcome(tuple(records), tuple(errors)))
 
 
-def _downsample_for_preview(image: np.ndarray) -> np.ndarray:
-    """Use integer decimation so previews stay responsive and memory bounded."""
+class _PreviewResolutionDataset:
+    """Present one chosen pyramid level to the existing color renderer."""
 
-    height, width = image.shape[:2]
-    factor = max(1, math.ceil(max(height, width) / PREVIEW_MAX_EDGE))
-    return np.ascontiguousarray(image[::factor, ::factor])
+    def __init__(self, dataset: ImageDataset, level: ResolutionLevelInfo) -> None:
+        self.dataset = dataset
+        self.level = level
+        self.metadata = dataset.metadata
+
+    def project_z_range(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]:
+        return self.dataset.project_z_range_at_resolution(
+            channel_index,
+            z_start,
+            z_end,
+            self.level,
+            chunk_depth,
+        )
 
 
 class PreviewWorker(QObject):
@@ -131,12 +174,16 @@ class PreviewWorker(QObject):
         settings: ExportSettings,
         display_adjustments: Mapping[int, DisplayAdjustmentSettings],
         preview_selection: int | tuple[int, ...],
+        target_width: int = 1200,
+        target_height: int = 1200,
     ) -> None:
         super().__init__()
         self.source_path = source_path
         self.settings = settings
         self.display_adjustments = dict(display_adjustments)
         self.preview_selection = preview_selection
+        self.target_width = max(1, int(target_width))
+        self.target_height = max(1, int(target_height))
 
     @Slot()
     def run(self) -> None:
@@ -145,19 +192,166 @@ class PreviewWorker(QObject):
                 reader = session.dataset
                 if reader.metadata is None:
                     raise IMSReaderError("Microscopy metadata could not be read.")
+                base_width = self.settings.output.width_px or reader.metadata.size_x
+                base_height = self.settings.output.height_px or reader.metadata.size_y
+                requested_factor = max(
+                    self.target_width / base_width,
+                    self.target_height / base_height,
+                )
+                source_limit_factor = max(
+                    reader.metadata.size_x / base_width,
+                    reader.metadata.size_y / base_height,
+                )
+                render_factor = min(requested_factor, source_limit_factor)
+                render_width = max(1, round(base_width * render_factor))
+                render_height = max(1, round(base_height * render_factor))
+                level = reader.choose_resolution_level(render_width, render_height)
+                preview_reader = _PreviewResolutionDataset(reader, level)
+                scaled_thickness = (
+                    max(1, round(self.settings.scale_bar.thickness_px * render_factor))
+                    if self.settings.scale_bar.thickness_px is not None
+                    else None
+                )
+                scaled_font_size = (
+                    max(1, round(self.settings.scale_bar.font_size_px * render_factor))
+                    if self.settings.scale_bar.font_size_px is not None
+                    else None
+                )
+                preview_settings = replace(
+                    self.settings,
+                    output=replace(
+                        self.settings.output,
+                        width_px=render_width,
+                        height_px=render_height,
+                    ),
+                    scale_bar=replace(
+                        self.settings.scale_bar,
+                        thickness_px=scaled_thickness,
+                        font_size_px=scaled_font_size,
+                    ),
+                )
                 if isinstance(self.preview_selection, tuple):
-                    preview_settings = replace(self.settings, merge_channel_indices=self.preview_selection)
-                    image, _ = render_merge(reader, preview_settings, self.display_adjustments)
+                    preview_settings = replace(preview_settings, merge_channel_indices=self.preview_selection)
+                    image, _ = render_merge(preview_reader, preview_settings, self.display_adjustments)
                 else:
                     image, _ = render_single_channel(
-                        reader,
+                        preview_reader,
                         self.settings,
                         self.preview_selection,
                         self.display_adjustments.get(self.preview_selection),
                     )
-                output_image, _ = prepare_output_image(image, reader, self.settings)
-                self.finished.emit(_downsample_for_preview(output_image))
+                output_image, _ = prepare_output_image(image, preview_reader, preview_settings)
+                self.finished.emit(
+                    PreviewRenderResult(
+                        np.ascontiguousarray(output_image),
+                        (base_width, base_height),
+                        level,
+                        reader.resolution_levels(),
+                    )
+                )
         except Exception as exc:  # Convert worker exceptions into a GUI error message.
+            self.failed.emit(str(exc))
+
+
+class CellCountWorker(QObject):
+    """Project selected channels and run one cell-counting plugin off the GUI thread."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        source_path: Path,
+        request: CellCountingRequest,
+        plugin: CellSegmenterPlugin,
+    ) -> None:
+        super().__init__()
+        self.source_path = source_path
+        self.request = request
+        self.plugin = plugin
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            with open_microscopy_dataset(self.source_path) as session:
+                dataset = session.dataset
+                metadata = dataset.metadata
+                if metadata is None:
+                    raise IMSReaderError("Microscopy metadata could not be read.")
+                channel_indices = tuple(
+                    sorted(
+                        set(self.request.detection_channel_indices)
+                        | set(self.request.measurement_channel_indices)
+                    )
+                )
+                raw_channels = {
+                    index: dataset.project_z_range(
+                        index,
+                        self.request.z_start,
+                        min(self.request.z_end, metadata.size_z),
+                    )[0]
+                    for index in channel_indices
+                }
+                channel_names = {channel.index: channel.name for channel in metadata.channels}
+                channel_colors = {channel.index: channel.color for channel in metadata.channels}
+                result: CellCountingResult = run_cell_counting(
+                    metadata.source_path,
+                    raw_channels,
+                    channel_names,
+                    channel_colors,
+                    self.request,
+                    self.plugin,
+                )
+                self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class FijiBridgeWorker(QObject):
+    """Stream selected raw data to OME-TIFF and launch external Fiji."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(
+        self,
+        source_path: Path,
+        fiji_directory: Path,
+        channel_indices: tuple[int, ...],
+        z_start: int,
+        z_end: int,
+    ) -> None:
+        super().__init__()
+        self.source_path = source_path
+        self.fiji_directory = fiji_directory
+        self.channel_indices = channel_indices
+        self.z_start = z_start
+        self.z_end = z_end
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            output_path = make_bridge_output_path(self.source_path)
+            with open_microscopy_dataset(self.source_path) as session:
+                export_dataset_to_ome_tiff(
+                    session.dataset,
+                    output_path,
+                    self.channel_indices,
+                    self.z_start,
+                    self.z_end,
+                    progress=lambda fraction, phase: self.progress.emit(round(fraction * 100), phase),
+                    is_cancelled=self._cancel_event.is_set,
+                )
+            result = launch_fiji(self.fiji_directory, output_path)
+            self.finished.emit(FijiBridgeOutcome(result))
+        except FijiBridgeCancelled:
+            self.finished.emit(FijiBridgeOutcome(None, cancelled=True))
+        except Exception as exc:
             self.failed.emit(str(exc))
 
 

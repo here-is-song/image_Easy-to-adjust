@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Slot
+from PySide6.QtCore import QObject, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Slot
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -17,6 +17,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPixmap,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,16 +49,22 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .exporter import default_output_directory
+from .fiji_bridge import FijiBridgeError, discover_fiji_installation, resolve_fiji_executable
 from .fv1200_calibration import FV1200_OBJECTIVES
-from .gui_controls import CollapsibleSection, PersistentSelectionMenu
-from .gui_dialogs import ExportImageSettingsDialog
+from .gui_controls import CollapsibleSection, InteractivePreviewLabel, PersistentSelectionMenu
+from .gui_dialogs import CellCountingDemoDialog, CellCountingResultsDialog, ExportImageSettingsDialog
 from .gui_workers import (
     BatchExportOutcome,
+    CellCountWorker,
     DatasetOpenOutcome,
     DatasetOpenWorker,
     ExportWorker,
+    FijiBridgeOutcome,
+    FijiBridgeWorker,
+    PreviewRenderResult,
     PreviewWorker,
 )
+from .image_dataset import ResolutionLevelInfo
 from .ims_reader import IMSReader, IMSReaderError
 from .models import (
     ChannelMetadata,
@@ -69,6 +76,7 @@ from .models import (
     ScaleBarSettings,
 )
 from .objective_detector import apply_manual_objective, detect_objective
+from .plugins.cell_counting import CellCountingResult, load_cell_counting_plugins
 from .settings_store import SettingsStore
 from .theme import apply_dark_theme
 
@@ -108,6 +116,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self.output_selection_name_groups: tuple[tuple[str, ...], ...] | None = None
         self.output_directory = stored.gui.output_directory
         self.last_input_directory = stored.gui.last_input_directory
+        self.fiji_directory = self.settings_store.load_fiji_directory()
+        if self.fiji_directory is None:
+            self.fiji_directory = discover_fiji_installation()
+            if self.fiji_directory is not None:
+                self.settings_store.save_fiji_directory(self.fiji_directory)
         self.output_width_px = stored.output.width_px or 1000
         self.output_height_px = stored.output.height_px or 1000
         self.output_dpi = stored.output.dpi
@@ -122,10 +135,20 @@ class IMSFigureExporterWindow(QMainWindow):
         self._worker: QObject | None = None
         self.preview_pixmap: QPixmap | None = None
         self.preview_zoom = 1.0
+        self.preview_rotation_degrees = 0.0
+        self.preview_full_size: tuple[int, int] | None = None
+        self.preview_resolution_level: ResolutionLevelInfo | None = None
+        self.preview_available_levels: tuple[ResolutionLevelInfo, ...] = ()
+        self.cell_counting_plugins = load_cell_counting_plugins()
+        self.last_cell_count_result: CellCountingResult | None = None
         self._preview_refresh_pending = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._run_scheduled_preview)
+        self._preview_detail_timer = QTimer(self)
+        self._preview_detail_timer.setSingleShot(True)
+        self._preview_detail_timer.setInterval(180)
+        self._preview_detail_timer.timeout.connect(self._refresh_preview_resolution)
         self._build_ui()
 
     def _save_export_settings(self) -> None:
@@ -168,6 +191,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self.refresh_preview_action.triggered.connect(self.update_preview)
         preview_menu.addAction(self.refresh_preview_action)
 
+        self.reset_preview_view_action = QAction("Reset Preview View", self)
+        self.reset_preview_view_action.setShortcut(QKeySequence("Ctrl+B"))
+        self.reset_preview_view_action.triggered.connect(self.reset_preview_view)
+        preview_menu.addAction(self.reset_preview_view_action)
+
         refresh_limit_menu = preview_menu.addMenu("Refresh Limit")
         self.refresh_limit_group = QActionGroup(self)
         self.refresh_limit_group.setExclusive(True)
@@ -204,6 +232,21 @@ class IMSFigureExporterWindow(QMainWindow):
         self.output_images_menu = PersistentSelectionMenu("&Output Images", self)
         self.menuBar().addMenu(self.output_images_menu)
         self.output_images_menu.setEnabled(False)
+
+        analysis_menu = self.menuBar().addMenu("&Analysis")
+        self.cell_count_demo_action = QAction("Cell Counting Plugin Demo…", self)
+        self.cell_count_demo_action.setEnabled(False)
+        self.cell_count_demo_action.triggered.connect(self.open_cell_counting_demo)
+        analysis_menu.addAction(self.cell_count_demo_action)
+
+        self.fiji_menu = analysis_menu.addMenu("Fiji Bridge")
+        self.send_to_fiji_action = QAction("Open Selected Data in Fiji…", self)
+        self.send_to_fiji_action.setEnabled(False)
+        self.send_to_fiji_action.triggered.connect(self.send_to_fiji)
+        self.fiji_menu.addAction(self.send_to_fiji_action)
+        self.configure_fiji_action = QAction("Configure Fiji Installation…", self)
+        self.configure_fiji_action.triggered.connect(self.configure_fiji_installation)
+        self.fiji_menu.addAction(self.configure_fiji_action)
 
         export_menu = self.menuBar().addMenu("&Export")
         self.export_settings_action = QAction("Export Image Settings…", self)
@@ -323,14 +366,25 @@ class IMSFigureExporterWindow(QMainWindow):
         self.fit_button = QPushButton("Fit")
         self.fit_button.clicked.connect(self.fit_preview)
         preview_header.addWidget(self.fit_button)
+        self.reset_rotation_button = QPushButton("0°")
+        self.reset_rotation_button.setToolTip("Reset preview rotation")
+        self.reset_rotation_button.clicked.connect(self.reset_preview_rotation)
+        preview_header.addWidget(self.reset_rotation_button)
         self.zoom_label = QLabel("100%")
         preview_header.addWidget(self.zoom_label)
         preview_header.addStretch(1)
         preview_layout.addLayout(preview_header)
-        self.preview_label = QLabel("Preview will appear here.")
+        self.preview_label = InteractivePreviewLabel("Preview will appear here.")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(1, 1)
         self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.preview_label.setToolTip(
+            "Mouse wheel: zoom · Left drag: pan · Right drag: rotate\n"
+            "View transforms do not change exported images."
+        )
+        self.preview_label.pan_requested.connect(self._pan_preview)
+        self.preview_label.rotation_requested.connect(self._rotate_preview)
+        self.preview_label.zoom_requested.connect(self._zoom_preview_by_factor)
         self.preview_scroll = QScrollArea()
         self.preview_scroll.setWidgetResizable(False)
         self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -583,6 +637,14 @@ class IMSFigureExporterWindow(QMainWindow):
 
     def _activate_metadata(self, metadata: IMSMetadata, requested_path: Path | None = None) -> None:
         self.metadata = metadata
+        self.preview_pixmap = None
+        self.preview_full_size = self._preview_base_size()
+        self.preview_resolution_level = None
+        self.preview_available_levels = ()
+        self.preview_zoom = 1.0
+        self.preview_rotation_degrees = 0.0
+        self.preview_label.clear()
+        self.preview_label.setText("Loading preview…")
         active_path = requested_path or metadata.source_path
         self.file_label.setText(str(active_path))
         voxel_text = " x ".join(
@@ -609,6 +671,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self._update_objective_display()
         self._update_export_enabled()
         self.refresh_preview_action.setEnabled(True)
+        self.cell_count_demo_action.setEnabled(True)
+        self.send_to_fiji_action.setEnabled(True)
         source_status = self.batch_source_status.get(active_path)
         status_suffix = f" {source_status}" if source_status else ""
         self.status_label.setText(
@@ -1160,7 +1224,17 @@ class IMSFigureExporterWindow(QMainWindow):
             else:
                 self.status_label.setText(message)
             return
-        worker = PreviewWorker(self.metadata.source_path, settings, self._display_adjustments(), preview_selection)
+        if self.preview_pixmap is None:
+            self._set_initial_preview_zoom()
+        target_width, target_height = self._preview_target_size()
+        worker = PreviewWorker(
+            self.metadata.source_path,
+            settings,
+            self._display_adjustments(),
+            preview_selection,
+            target_width,
+            target_height,
+        )
         self._run_worker(worker, self._preview_finished)
 
     def _schedule_preview_refresh(self, *_: object) -> None:
@@ -1213,6 +1287,79 @@ class IMSFigureExporterWindow(QMainWindow):
         )
         self._run_worker(worker, self._export_finished)
 
+    @Slot()
+    def open_cell_counting_demo(self) -> None:
+        if self.metadata is None:
+            return
+        dialog = CellCountingDemoDialog(
+            self,
+            self.metadata,
+            self.cell_counting_plugins,
+            self.z_start.value(),
+            self.z_end.value(),
+            self.preview_pixmap,
+            self._preview_base_size(),
+            self.output_resize_mode,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        worker = CellCountWorker(
+            self.metadata.source_path,
+            dialog.request(),
+            dialog.selected_plugin(),
+        )
+        self._run_worker(worker, self._cell_count_finished)
+
+    def _active_source_path(self) -> Path | None:
+        selected = self.batch_tree.selectedItems()
+        if selected:
+            return Path(str(selected[0].data(0, Qt.ItemDataRole.UserRole)))
+        return self.metadata.source_path if self.metadata is not None else None
+
+    @Slot()
+    def configure_fiji_installation(self) -> bool:
+        initial = str(self.fiji_directory or self.last_input_directory or Path.home())
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select the Fiji.app folder",
+            initial,
+        )
+        if not selected:
+            return False
+        directory = Path(selected).resolve()
+        try:
+            resolve_fiji_executable(directory)
+        except FijiBridgeError as exc:
+            QMessageBox.warning(self, "Invalid Fiji installation", str(exc))
+            return False
+        self.fiji_directory = directory
+        self.settings_store.save_fiji_directory(directory)
+        self.status_label.setText(f"Fiji installation: {directory}")
+        return True
+
+    @Slot()
+    def send_to_fiji(self) -> None:
+        settings = self._current_settings()
+        source_path = self._active_source_path()
+        if settings is None or source_path is None:
+            return
+        if self.fiji_directory is None:
+            if not self.configure_fiji_installation():
+                return
+        try:
+            resolve_fiji_executable(self.fiji_directory)
+        except FijiBridgeError:
+            if not self.configure_fiji_installation():
+                return
+        worker = FijiBridgeWorker(
+            source_path,
+            self.fiji_directory,
+            settings.channel_indices,
+            settings.z_start,
+            settings.z_end,
+        )
+        self._run_worker(worker, self._fiji_bridge_finished)
+
     def _run_worker(self, worker: QObject, completed_slot: object) -> None:
         if self._thread is not None:
             return
@@ -1233,6 +1380,11 @@ class IMSFigureExporterWindow(QMainWindow):
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
             self.cancel_button.setEnabled(True)
+        elif isinstance(worker, FijiBridgeWorker):
+            worker.progress.connect(self._fiji_bridge_progress)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.cancel_button.setEnabled(True)
         else:
             self.progress_bar.setRange(0, 0)
             self.cancel_button.setEnabled(False)
@@ -1245,6 +1397,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self.batch_tree.setEnabled(False)
         self.export_settings_action.setEnabled(False)
         self.output_images_menu.setEnabled(False)
+        self.cell_count_demo_action.setEnabled(False)
+        self.send_to_fiji_action.setEnabled(False)
         self.update_button.setEnabled(False)
         self.refresh_preview_action.setEnabled(False)
         self.export_button.setEnabled(False)
@@ -1265,16 +1419,37 @@ class IMSFigureExporterWindow(QMainWindow):
         self.progress_bar.setValue(min(max(percent, 0), 100))
         self.status_label.setText(phase)
 
+    @Slot(int, str)
+    def _fiji_bridge_progress(self, percent: int, phase: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(min(max(percent, 0), 100))
+        self.status_label.setText(phase)
+
     @Slot()
     def cancel_processing(self) -> None:
-        if isinstance(self._worker, (ExportWorker, DatasetOpenWorker)):
+        if isinstance(self._worker, (ExportWorker, DatasetOpenWorker, FijiBridgeWorker)):
             self._worker.cancel()
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Cancelling safely…")
 
     @Slot(object)
     def _preview_finished(self, image: object) -> None:
-        array = np.asarray(image)
+        if isinstance(image, PreviewRenderResult):
+            result = image
+            array = np.asarray(result.image)
+            self.preview_full_size = result.full_size
+            self.preview_resolution_level = result.level
+            self.preview_available_levels = result.available_levels
+        else:
+            array = np.asarray(image)
+            self.preview_full_size = (array.shape[1], array.shape[0])
+            self.preview_resolution_level = ResolutionLevelInfo(
+                0,
+                array.shape[1],
+                array.shape[0],
+                1,
+            )
+            self.preview_available_levels = (self.preview_resolution_level,)
         if array.ndim == 2:
             qimage = QImage(
                 array.data,
@@ -1292,8 +1467,23 @@ class IMSFigureExporterWindow(QMainWindow):
                 QImage.Format.Format_RGB888,
             )
         self.preview_pixmap = QPixmap.fromImage(qimage.copy())
-        self.fit_preview()
-        self.status_label.setText("Preview updated.")
+        self._render_preview_pixmap()
+        level_text = (
+            f"ResolutionLevel {self.preview_resolution_level.index} · "
+            f"{self.preview_resolution_level.size_x} × {self.preview_resolution_level.size_y}"
+            if self.preview_resolution_level is not None
+            else f"{array.shape[1]} × {array.shape[0]}"
+        )
+        self.status_label.setText(f"Preview updated: {level_text}.")
+
+    @Slot(object)
+    def _cell_count_finished(self, result: object) -> None:
+        if not isinstance(result, CellCountingResult):
+            self._worker_failed("The cell-counting plugin returned an unexpected result.")
+            return
+        self.last_cell_count_result = result
+        self.status_label.setText(f"Cell counting completed: {result.total_count} objects.")
+        CellCountingResultsDialog(self, result).exec()
 
     @Slot()
     def zoom_in(self) -> None:
@@ -1312,25 +1502,152 @@ class IMSFigureExporterWindow(QMainWindow):
         if self.preview_pixmap is None or self.preview_pixmap.isNull():
             return
         viewport = self.preview_scroll.viewport().size()
-        width_ratio = max(1, viewport.width() - 8) / self.preview_pixmap.width()
-        height_ratio = max(1, viewport.height() - 8) / self.preview_pixmap.height()
+        base_width, base_height = self._rotated_full_size()
+        width_ratio = max(1, viewport.width() - 8) / base_width
+        height_ratio = max(1, viewport.height() - 8) / base_height
         self._set_preview_zoom(min(width_ratio, height_ratio, 1.0))
 
     def _set_preview_zoom(self, zoom: float) -> None:
         if self.preview_pixmap is None or self.preview_pixmap.isNull():
             return
-        self.preview_zoom = min(8.0, max(0.05, zoom))
-        width = max(1, round(self.preview_pixmap.width() * self.preview_zoom))
-        height = max(1, round(self.preview_pixmap.height() * self.preview_zoom))
-        scaled = self.preview_pixmap.scaled(
-            width,
-            height,
+        self.preview_zoom = min(16.0, max(0.02, zoom))
+        self._render_preview_pixmap()
+        if self.metadata is not None:
+            self._preview_detail_timer.start()
+
+    def _set_initial_preview_zoom(self) -> None:
+        if self.metadata is None:
+            return
+        viewport = self.preview_scroll.viewport().size()
+        base_width, base_height = self._preview_base_size()
+        width_ratio = max(1, viewport.width() - 8) / base_width
+        height_ratio = max(1, viewport.height() - 8) / base_height
+        self.preview_zoom = min(width_ratio, height_ratio, 1.0)
+
+    def _preview_base_size(self) -> tuple[int, int]:
+        if self.metadata is None:
+            return 1200, 1200
+        return (
+            self.output_width_px or self.metadata.size_x,
+            self.output_height_px or self.metadata.size_y,
+        )
+
+    def _preview_target_size(self) -> tuple[int, int]:
+        if self.metadata is None:
+            return 1200, 1200
+        pixel_ratio = max(1.0, self.preview_scroll.devicePixelRatioF())
+        base_width, base_height = self._preview_base_size()
+        return (
+            max(1, round(base_width * self.preview_zoom * pixel_ratio)),
+            max(1, round(base_height * self.preview_zoom * pixel_ratio)),
+        )
+
+    def _rotated_full_size(self) -> tuple[float, float]:
+        if self.preview_full_size is not None:
+            width, height = self.preview_full_size
+        elif self.preview_pixmap is not None:
+            width, height = self.preview_pixmap.width(), self.preview_pixmap.height()
+        else:
+            return 1.0, 1.0
+        bounds = QTransform().rotate(self.preview_rotation_degrees).mapRect(
+            QRectF(0.0, 0.0, float(width), float(height))
+        )
+        return max(1.0, bounds.width()), max(1.0, bounds.height())
+
+    def _render_preview_pixmap(self) -> None:
+        if self.preview_pixmap is None or self.preview_pixmap.isNull():
+            return
+        transformed = self.preview_pixmap.transformed(
+            QTransform().rotate(self.preview_rotation_degrees),
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        target_width, target_height = self._rotated_full_size()
+        target_width = max(1, round(target_width * self.preview_zoom))
+        target_height = max(1, round(target_height * self.preview_zoom))
+        scaled = transformed.scaled(
+            target_width,
+            target_height,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
         self.preview_label.setPixmap(scaled)
         self.preview_label.resize(scaled.size())
-        self.zoom_label.setText(f"{self.preview_zoom * 100:.0f}%")
+        level_suffix = (
+            f" · L{self.preview_resolution_level.index}"
+            if self.preview_resolution_level is not None
+            else ""
+        )
+        self.zoom_label.setText(
+            f"{self.preview_zoom * 100:.0f}% · {self.preview_rotation_degrees:.0f}°{level_suffix}"
+        )
+
+    @Slot(float)
+    def _zoom_preview_by_factor(self, factor: float) -> None:
+        horizontal = self.preview_scroll.horizontalScrollBar()
+        vertical = self.preview_scroll.verticalScrollBar()
+        viewport = self.preview_scroll.viewport()
+        cursor = viewport.mapFromGlobal(self.cursor().pos())
+        old_width = max(1, self.preview_label.width())
+        old_height = max(1, self.preview_label.height())
+        relative_x = (horizontal.value() + cursor.x()) / old_width
+        relative_y = (vertical.value() + cursor.y()) / old_height
+        self._set_preview_zoom(self.preview_zoom * factor)
+        horizontal.setValue(round(relative_x * self.preview_label.width() - cursor.x()))
+        vertical.setValue(round(relative_y * self.preview_label.height() - cursor.y()))
+
+    @Slot(int, int)
+    def _pan_preview(self, delta_x: int, delta_y: int) -> None:
+        horizontal = self.preview_scroll.horizontalScrollBar()
+        vertical = self.preview_scroll.verticalScrollBar()
+        horizontal.setValue(horizontal.value() - delta_x)
+        vertical.setValue(vertical.value() - delta_y)
+
+    @Slot(float)
+    def _rotate_preview(self, delta_degrees: float) -> None:
+        self.preview_rotation_degrees = (self.preview_rotation_degrees + delta_degrees) % 360.0
+        if self.preview_rotation_degrees > 180.0:
+            self.preview_rotation_degrees -= 360.0
+        self._render_preview_pixmap()
+
+    @Slot()
+    def reset_preview_rotation(self) -> None:
+        self.preview_rotation_degrees = 0.0
+        self._render_preview_pixmap()
+
+    @Slot()
+    def reset_preview_view(self) -> None:
+        """Restore the preview to 100%, zero rotation, and a centred position."""
+
+        if self.preview_pixmap is None or self.preview_pixmap.isNull():
+            return
+        self.preview_rotation_degrees = 0.0
+        self._set_preview_zoom(1.0)
+        horizontal = self.preview_scroll.horizontalScrollBar()
+        vertical = self.preview_scroll.verticalScrollBar()
+        horizontal.setValue(horizontal.maximum() // 2)
+        vertical.setValue(vertical.maximum() // 2)
+        self.status_label.setText("Preview view reset to 100% and 0°.")
+
+    @Slot()
+    def _refresh_preview_resolution(self) -> None:
+        if not self.preview_available_levels or self.preview_resolution_level is None:
+            return
+        target_width, target_height = self._preview_target_size()
+        adequate = [
+            level
+            for level in self.preview_available_levels
+            if level.size_x >= target_width and level.size_y >= target_height
+        ]
+        desired = (
+            min(adequate, key=lambda level: (level.pixel_count_xy, level.index))
+            if adequate
+            else max(
+                self.preview_available_levels,
+                key=lambda level: (level.pixel_count_xy, -level.index),
+            )
+        )
+        if desired.index != self.preview_resolution_level.index:
+            self._start_preview(show_warnings=False)
 
     @Slot(object)
     def _export_finished(self, outcome: object) -> None:
@@ -1401,6 +1718,26 @@ class IMSFigureExporterWindow(QMainWindow):
         self.status_label.setText("Processing failed.")
         QMessageBox.critical(self, "Processing failed", reason)
 
+    @Slot(object)
+    def _fiji_bridge_finished(self, outcome: object) -> None:
+        if not isinstance(outcome, FijiBridgeOutcome):
+            self._worker_failed("The Fiji bridge returned an unexpected result.")
+            return
+        if outcome.cancelled:
+            self.status_label.setText("Sending data to Fiji was cancelled.")
+            return
+        if outcome.result is None:
+            self._worker_failed("Fiji did not receive an image.")
+            return
+        self.status_label.setText(f"Opened in Fiji: {outcome.result.ome_tiff_path.name}")
+        QMessageBox.information(
+            self,
+            "Opened in Fiji",
+            "The selected raw channels and Z range were exported as OME-TIFF and opened in Fiji.\n\n"
+            f"Temporary bridge file:\n{outcome.result.ome_tiff_path}\n\n"
+            "Display Min/Max/Gamma are intentionally not baked into the raw data.",
+        )
+
     @Slot()
     def _worker_finished(self) -> None:
         self._thread = None
@@ -1410,6 +1747,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self.batch_tree.setEnabled(True)
         self.export_settings_action.setEnabled(True)
         self.output_images_menu.setEnabled(self.metadata is not None)
+        self.cell_count_demo_action.setEnabled(self.metadata is not None)
+        self.send_to_fiji_action.setEnabled(self.metadata is not None)
         self.update_button.setEnabled(self.metadata is not None)
         self.refresh_preview_action.setEnabled(self.metadata is not None)
         self.cancel_button.setEnabled(False)

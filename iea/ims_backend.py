@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .image_dataset import ResolutionLevelInfo
 from .ims_reader import IMSReader
 from .models import IMSMetadata
 
@@ -43,3 +44,22 @@ class IMSPixelBackend:
             raise ValueError("IEA currently exposes TimePoint 0 from IMS files.")
         stack = self.reader.read_z_range(channel_index, z_start + 1, z_end)
         return np.ascontiguousarray(stack[:, y_start:y_end, x_start:x_end])
+
+    def resolution_levels(self) -> tuple[ResolutionLevelInfo, ...]:
+        return self.reader.resolution_levels()
+
+    def project_z_range_at_resolution(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        resolution_level: int,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]:
+        return self.reader.project_z_range_at_resolution(
+            channel_index,
+            z_start,
+            z_end,
+            resolution_level,
+            chunk_depth,
+        )

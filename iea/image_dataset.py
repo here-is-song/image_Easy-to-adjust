@@ -16,6 +16,20 @@ class ImageDatasetError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ResolutionLevelInfo:
+    """One image-pyramid level, expressed in logical X/Y/Z dimensions."""
+
+    index: int
+    size_x: int
+    size_y: int
+    size_z: int
+
+    @property
+    def pixel_count_xy(self) -> int:
+        return self.size_x * self.size_y
+
+
+@dataclass(frozen=True)
 class DisplaySettings:
     """Non-destructive display mapping for one raw microscopy channel."""
 
@@ -317,6 +331,63 @@ class ImageDataset:
         if projection is None:
             raise ImageDatasetError("The selected Z range did not contain image data.")
         return projection, data_min, data_max
+
+    def resolution_levels(self) -> tuple[ResolutionLevelInfo, ...]:
+        """Return native pyramid levels, or a single full-resolution fallback."""
+
+        metadata = self._require_metadata()
+        provider = getattr(self.backend, "resolution_levels", None)
+        if callable(provider):
+            levels = tuple(provider())
+            if levels:
+                return levels
+        return (ResolutionLevelInfo(0, metadata.size_x, metadata.size_y, metadata.size_z),)
+
+    def choose_resolution_level(self, target_width: int, target_height: int) -> ResolutionLevelInfo:
+        """Choose the least expensive level that still satisfies the screen request."""
+
+        target_width = max(1, int(target_width))
+        target_height = max(1, int(target_height))
+        levels = self.resolution_levels()
+        adequate = [
+            level
+            for level in levels
+            if level.size_x >= target_width and level.size_y >= target_height
+        ]
+        if adequate:
+            return min(adequate, key=lambda level: (level.pixel_count_xy, level.index))
+        return max(levels, key=lambda level: (level.pixel_count_xy, -level.index))
+
+    def project_z_range_at_resolution(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        level: ResolutionLevelInfo,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]:
+        """Project at a native pyramid level when the backend supports it."""
+
+        provider = getattr(self.backend, "project_z_range_at_resolution", None)
+        if callable(provider):
+            return provider(channel_index, z_start, z_end, level.index, chunk_depth)
+        projection, data_min, data_max = self.project_z_range(
+            channel_index,
+            z_start,
+            z_end,
+            chunk_depth,
+        )
+        if projection.shape == (level.size_y, level.size_x):
+            return projection, data_min, data_max
+        # This path is mainly for non-pyramidal backends. Native IMS levels avoid
+        # the full-resolution read and therefore remain the preferred fast path.
+        from PIL import Image
+
+        resized = Image.fromarray(projection).resize(
+            (level.size_x, level.size_y),
+            Image.Resampling.BILINEAR,
+        )
+        return np.asarray(resized), data_min, data_max
 
     def _require_metadata(self) -> IMSMetadata:
         if self._metadata is None:

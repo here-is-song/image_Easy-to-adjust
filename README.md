@@ -1,6 +1,6 @@
 # image_easy-to-adjust (IEA)
 
-这是一个面向 Windows 的桌面和命令行工具，用于检查 Bitplane Imaris `.ims` 文件，并把指定通道和 Z 范围导出为论文制图用 TIFF 或 PNG。当前支持单文件和批量处理、可调预览、比例尺、导出尺寸/DPI 与可复现导出记录；不包含 3D 渲染。
+这是一个面向 Windows 的桌面和命令行工具，用于打开 Olympus `.oib` 和 Bitplane Imaris `.ims` 显微镜文件，并把指定通道和 Z 范围导出为论文制图用 TIFF 或 PNG。当前支持 OIB 自动建立同名 IMS 缓存、单文件和批量处理、可调预览、比例尺、导出尺寸/DPI 与可复现导出记录；不包含 3D 渲染、细胞分割或计数。
 
 当前版本为 `v0.3.0`，详细变化请参阅 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -16,6 +16,14 @@ python -m pip install -e .
 
 安装后可使用 `iea` 命令运行 CLI，或使用 `iea-gui` 启动桌面窗口。根目录的 `python main.py` 和 BAT 启动方式继续兼容。
 
+如需打开 OIB 并生成 IMS 缓存，请安装额外的 Bio-Formats 和官方 ImarisWriter 依赖：
+
+```powershell
+python -m pip install -e ".[oib]"
+```
+
+也可以运行 `python -m pip install -r requirements-oib.txt`。第一次读取 OIB 时，Bio-Formats 会下载约 189 MiB 的完整 Java 11 JDK 和所需 Java libraries，因此会比后续打开更慢。IEA 会在 Windows 中文安装路径下把很小的 JPype bridge 镜像到 ASCII 临时目录，原始 OIB 不会被移动。`bioio-bioformats` 使用 GPL-3.0 许可证；在分发包含该组件的程序前，请一并检查其许可证要求。
+
 构建 Python wheel/source package：
 
 ```powershell
@@ -29,6 +37,23 @@ python -m build
 python -m pip install -e ".[package]"
 pyinstaller --clean IEA.spec
 ```
+
+`IEA.spec` 已收集当前 OIB 运行时和 ImarisWriter 的 Python 模块、数据文件与本地库，但不同电脑上的 Java/Bio-Formats 首次启动仍应单独做一次真实 OIB 验证。
+
+## OIB → IMS 缓存工作流
+
+从 GUI 的 `File > Open Microscopy Files` 可以同时选择 `.oib` 和 `.ims` 文件。打开 `sample.oib` 时，IEA 只在同一文件夹检查 basename 完全相同、扩展名大小写不敏感的 `sample.ims`：
+
+- 同名 IMS 有效：直接使用 IMS，不读取 OIB 像素、不运行 Auto Display、不改写缓存，并保留 IMS 已有的通道颜色、Min、Max 和 Gamma。
+- 没有同名 IMS：使用 Bio-Formats 分块读取 OIB，逐通道估计显示范围，再由官方 PyImarisWriter 写入 `sample.ims.tmp`；只有写入完成后才原子重命名为 `sample.ims`。
+- 同名 IMS 损坏：安全回退到原 OIB，并报告缓存无效；初版不会自动覆盖损坏的 IMS。
+- 直接打开 IMS：不寻找 OIB，也不运行 Auto Display。
+
+OIB 始终只读。第一次转换后的当前会话继续使用 Bio-Formats 数据集，下一次打开才优先使用 IMS 缓存。GUI 中读取、分析和写入在后台线程运行，并显示 `Reading OIB...`、`Analyzing display range...`、`Creating IMS...` 等进度。
+
+软件内部使用统一的 `ImageDataset / ImageSession`，预览、比例尺、Z-stack、图像导出只访问格式无关的分块接口。IMS 是持久缓存和 Imaris 兼容格式，不是应用内部数据模型；`ImageSession` 已为未来的 segmentation、ROI 和 measurement layer 预留空集合，本版本没有实现这些分析功能。
+
+首次 OIB 转换会逐通道执行 Imaris-like Auto Display：均匀抽取最多 32 个 Z 平面和有限数量 XY 像素；Min 使用对零峰、坏点和极端值有保护的第一个显著直方图 mode，失败时记录日志并回退到 P0.5；Max 使用采样 P99.8；Gamma 为 `1.0`。这些值只是显示映射，写入 IMS 的仍是未归一化、未缩放、未转换类型的原始 voxel。
 
 ## Milestone 1：检查 IMS metadata
 
@@ -111,6 +136,11 @@ sample_Export/
 ## 当前限制
 
 - 只使用 `ResolutionLevel 0` 和 `TimePoint 0`；多时间点文件会显示警告。
+- OIB 初版使用第一个 Bio-Formats scene；多 scene 文件会显示警告。
+- OIB 转 IMS 目前只接受官方 PyImarisWriter 原生支持的 `uint8`、`uint16` 和 `float32`；其他类型不会被静默转换或归一化。
+- 多层 OIB 如果缺少可靠的 PhysicalSizeZ，或任何 OIB 缺少 PhysicalSizeX/Y，将停止创建科学尺度不可靠的 IMS；缺失 metadata 保持为 `None`，不会猜测。
+- Bio-Formats 能读取但官方 ImarisWriter 标准字段无法表达的厂商私有 metadata，会保留在当前运行时 metadata 中，但不会私自写入未知 IMS HDF5 字段。
+- 仓库不提交真实 OIB 实验数据；自动测试使用合成后端，并额外通过官方 ImarisWriter 写入/IMSReader 读回验证原始体素和显示 metadata。本地真实样本已完成逐 voxel 验证。
 - 只做 Maximum Intensity Projection。
 - 支持 NumPy 可识别的整数和浮点图像数据；主要目标是常见的 `uint8`、`uint16`。
 - 需要 `DataSetInfo/Image` 中可靠的物理 extent 才能生成科学上正确的比例尺。
@@ -122,6 +152,8 @@ sample_Export/
 python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+真实 OIB 建议按以下方式验收：先备份样本并确认同目录没有同名 IMS，运行 `python main.py "D:\data\sample.oib"` 或从 GUI 打开；观察四个阶段和同目录新建的 IMS。记录 OIB 的文件大小、修改时间和校验值，确认转换前后完全一致；关闭后再次打开同一个 OIB，确认状态显示 `Using existing IMS cache` 且不再分析 histogram。最后分别在 IEA 和 Imaris Viewer 中检查尺寸、通道名称/颜色、Min/Max/Gamma、比例尺，并抽查几个 T/C/Z/Y/X 坐标的原始强度。
 
 ## GUI（Milestone 5）
 
@@ -139,7 +171,7 @@ Windows 下推荐双击项目目录中的 `image_easy-to-adjust.lnk` 启动；�
 
 当 IMS 没有记录通道颜色时，程序会识别常用染料名称：`Alexa Fluor 488` 使用绿色、`Alexa Fluor 594` 使用红色、`DRAQ5` 使用蓝色。`Channels` 模块底部的 `Convert red to magenta` 开启时，会把红色通道转换为品红色，并同时作用于预览和导出；关闭后保持原始红色。IMS 读取警告显示在窗口左下方，并用四个空格连接为单行，鼠标悬停时也可查看完整内容。
 
-预览区提供“−”“+”“100%”和“Fit”按钮，可缩小、放大、按原始预览尺寸显示或适应窗口。这里的缩放只改变屏幕显示，不会改变最终导出的像素尺寸和图像内容。
+预览默认使用 `Merge: Selected Channels`，并始终跟随 `Channels` 中当前勾选的通道：三个通道显示三色 Merge，两个通道显示对应双色 Merge，只剩一个通道时仍显示该通道的伪彩色图像而不是灰度图。该默认预览独立于 `Output Images` 导出清单；预览区还提供“−”“+”“100%”和“Fit”按钮，可缩小、放大、按原始预览尺寸显示或适应窗口。这里的缩放只改变屏幕显示，不会改变最终导出的像素尺寸和图像内容。
 
 左侧参数区域和右侧 Preview 区域之间有一条竖向分隔线。按住分隔线并左右拖动，可以随时调整两部分的宽度占比；两侧都设有最小宽度，不会被意外完全折叠。
 
@@ -147,7 +179,7 @@ Windows 下推荐双击项目目录中的 `image_easy-to-adjust.lnk` 启动；�
 
 修改通道、Z 范围、显示范围、颜色或比例尺等参数后，预览会自动刷新。菜单栏的 `Preview > Refresh Limit` 子菜单用于限制刷新频率，可选择每秒最多 2 次、每秒最多 1 次、每 2 秒一次或每 5 秒一次；默认每秒最多 1 次。短时间内连续修改多个参数时，程序会合并这些变化，避免同时启动多个预览计算。
 
-菜单栏的 `File > Open IMS Files` 可一次选择一个或多个 IMS 文件。程序会记住最近一次成功打开 IMS 的文件夹，下次打开文件选择窗口时从该文件夹开始；如果文件夹已不存在，则使用系统默认位置。文件会显示在左侧 `Batch Files` 列表中，当前选中行用于 Preview；自动预览只计算这一张，避免批量文件同时刷新。每个文件的 `Process` 和 `Export` 默认都勾选：取消 `Process` 会同时取消导出，重新勾选 `Export` 会自动恢复 `Process`。`Batch` 菜单可批量全选或清空这两列。当前界面参数会统一应用到所有最终勾选导出的文件；文件的 Z 层数较少时，程序会自动限制到该文件的有效范围。
+菜单栏的 `File > Open Microscopy Files` 可一次选择一个或多个 IMS/OIB 文件。程序会记住最近一次成功打开显微镜文件的文件夹，下次打开文件选择窗口时从该文件夹开始；如果文件夹已不存在，则使用系统默认位置。文件会显示在左侧 `Batch Files` 列表中，当前选中行用于 Preview；自动预览只计算这一张，避免批量文件同时刷新。每个文件的 `Process` 和 `Export` 默认都勾选：取消 `Process` 会同时取消导出，重新勾选 `Export` 会自动恢复 `Process`。`Batch` 菜单可批量全选或清空这两列。当前界面参数会统一应用到所有最终勾选导出的文件；文件的 Z 层数较少时，程序会自动限制到该文件的有效范围。
 
 批量处理时，通道和 Display Min/Max/Gamma 会优先按通道名称匹配，而不是直接套用通道编号。因此，即使不同文件中的通道排列顺序不同，参数仍会应用到同名通道。遇到缺失或重名通道时，程序会显示警告并跳过无法可靠匹配的项。
 
@@ -195,6 +227,14 @@ iea/
   batch.py            批量文件的通道匹配
   fv1200_calibration.py  FV1200 固定物镜 calibration profile
   objective_detector.py 独立物镜检测与手动覆盖逻辑
+  image_dataset.py     统一 ImageDataset / ImageSession 和分块像素接口
+  dataset_loader.py    IMS 优先加载与同名 OIB 缓存流程
+  bioformats_reader.py Bio-Formats OIB lazy/block reader
+  java_runtime.py      Windows Java/JPype 中文路径兼容层
+  ims_backend.py       现有 IMSReader 的统一后端适配器
+  imaris_writer.py     官方 PyImarisWriter 流式写入适配器
+  auto_display.py      逐通道采样直方图与 Imaris-like Auto Display
+  memory_backend.py    测试和未来生成数据层使用的内存后端
   ims_reader.py       IMS 读取与分块 MIP
   exporter.py         渲染与导出流程
 tests/                 自动化测试

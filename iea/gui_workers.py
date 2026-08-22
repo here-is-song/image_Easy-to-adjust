@@ -12,6 +12,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
 from .batch import adapt_settings_for_metadata
+from .dataset_loader import DatasetLoader, open_microscopy_dataset
 from .exporter import (
     ExportResult,
     export_channels_and_merge,
@@ -21,8 +22,8 @@ from .exporter import (
     write_export_info,
     write_ppt_summary,
 )
-from .ims_reader import IMSReader, IMSReaderError
-from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings
+from .ims_reader import IMSReaderError
+from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings, IMSMetadata
 
 PREVIEW_MAX_EDGE = 1200
 
@@ -35,6 +36,79 @@ class BatchExportOutcome:
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
     cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class DatasetOpenRecord:
+    requested_path: Path
+    metadata: IMSMetadata
+    active_backend: str
+    cache_path: Path | None
+    cache_status: str
+    messages: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DatasetOpenOutcome:
+    records: tuple[DatasetOpenRecord, ...]
+    errors: tuple[str, ...]
+
+
+class DatasetOpenWorker(QObject):
+    """Open/convert OIB sources away from the Qt main thread."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, source_paths: tuple[Path, ...], loader: DatasetLoader | None = None) -> None:
+        super().__init__()
+        self.source_paths = source_paths
+        self.loader = loader or DatasetLoader()
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        records: list[DatasetOpenRecord] = []
+        errors: list[str] = []
+        for position, source_path in enumerate(self.source_paths):
+            if self._cancel_event.is_set():
+                break
+
+            def report(fraction: float, phase: str) -> None:
+                overall = (position + min(max(fraction, 0.0), 1.0)) / max(1, len(self.source_paths))
+                self.progress.emit(round(overall * 100), phase)
+
+            try:
+                with self.loader.open(
+                    source_path,
+                    progress=report,
+                    is_cancelled=self._cancel_event.is_set,
+                ) as session:
+                    metadata = session.dataset.metadata
+                    if metadata is None:
+                        raise IMSReaderError("Normalized microscopy metadata could not be read.")
+                    records.append(
+                        DatasetOpenRecord(
+                            requested_path=source_path.resolve(),
+                            metadata=metadata,
+                            active_backend=session.active_backend,
+                            cache_path=session.cache_path,
+                            cache_status=session.relationship.cache_status,
+                            messages=session.messages,
+                        )
+                    )
+            except Exception as exc:
+                errors.append(f"{source_path.name}: {exc}")
+        if not records:
+            reason = "Opening microscopy files was cancelled." if self._cancel_event.is_set() else "\n".join(errors)
+            self.failed.emit(reason)
+            return
+        self.progress.emit(100, "Microscopy files opened")
+        self.finished.emit(DatasetOpenOutcome(tuple(records), tuple(errors)))
 
 
 def _downsample_for_preview(image: np.ndarray) -> np.ndarray:
@@ -67,9 +141,10 @@ class PreviewWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            with IMSReader(self.source_path) as reader:
+            with open_microscopy_dataset(self.source_path) as session:
+                reader = session.dataset
                 if reader.metadata is None:
-                    raise IMSReaderError("IMS metadata could not be read.")
+                    raise IMSReaderError("Microscopy metadata could not be read.")
                 if isinstance(self.preview_selection, tuple):
                     preview_settings = replace(self.settings, merge_channel_indices=self.preview_selection)
                     image, _ = render_merge(reader, preview_settings, self.display_adjustments)
@@ -123,9 +198,10 @@ class ExportWorker(QObject):
                 break
             self.progress.emit(position - 1, total, source_path.name)
             try:
-                with IMSReader(source_path) as reader:
+                with open_microscopy_dataset(source_path) as session:
+                    reader = session.dataset
                     if reader.metadata is None:
-                        raise IMSReaderError("IMS metadata could not be read.")
+                        raise IMSReaderError("Microscopy metadata could not be read.")
                     matched = adapt_settings_for_metadata(self.settings, self.channel_selections, reader.metadata)
                     if not matched.settings.required_output_channel_indices:
                         raise IMSReaderError("None of the requested output channels exist in this file.")

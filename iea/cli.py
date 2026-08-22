@@ -1,4 +1,4 @@
-"""Command-line entry point for IMS inspection and image export."""
+"""Command-line entry point for microscopy inspection and image export."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .dataset_loader import DatasetLoaderError, open_microscopy_dataset
 from .exporter import (
     export_channels_and_merge,
     export_merge,
@@ -13,7 +14,8 @@ from .exporter import (
     write_export_info,
     write_ppt_summary,
 )
-from .ims_reader import IMSReader, IMSReaderError
+from .image_dataset import ImageDatasetError
+from .ims_reader import IMSReaderError
 from .models import (
     ExportSettings,
     ImageOutputSettings,
@@ -23,8 +25,10 @@ from .models import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inspect an Imaris IMS file and export publication image projections.")
-    parser.add_argument("ims_file", type=Path, nargs="?", help="Path to the source .ims file")
+    parser = argparse.ArgumentParser(
+        description="Inspect an OIB/IMS microscopy file and export publication image projections."
+    )
+    parser.add_argument("ims_file", type=Path, nargs="?", help="Path to a source .ims or .oib file")
     parser.add_argument(
         "--structure",
         action="store_true",
@@ -83,12 +87,15 @@ def build_parser() -> argparse.ArgumentParser:
 def print_metadata(metadata: IMSMetadata) -> None:
     print(f"File: {metadata.source_path}")
     print(f"Image size: {metadata.size_x} × {metadata.size_y} × {metadata.size_z} (X × Y × Z)")
-    print(
-        "Voxel size: "
-        f"{metadata.voxel_size_x_um:.6g} × "
-        f"{metadata.voxel_size_y_um:.6g} × "
-        f"{metadata.voxel_size_z_um:.6g} um"
+    voxel_text = " × ".join(
+        f"{value:.6g}" if value is not None else "N/A"
+        for value in (
+            metadata.voxel_size_x_um,
+            metadata.voxel_size_y_um,
+            metadata.voxel_size_z_um,
+        )
     )
+    print(f"Voxel size: {voxel_text} um")
     print(f"Data type: {metadata.dtype}")
     print(f"Time points: {metadata.time_point_count} (TimePoint 0 is used)")
     objective = metadata.objective_detection
@@ -130,14 +137,21 @@ def run(argv: list[str] | None = None) -> int:
             return 1
         return launch_gui()
     try:
-        with IMSReader(args.ims_file) as reader:
+        with open_microscopy_dataset(
+            args.ims_file,
+            progress=lambda _fraction, phase: print(phase, file=sys.stderr),
+        ) as session:
+            reader = session.dataset
             if reader.metadata is None:
-                raise IMSReaderError("IMS metadata could not be read.")
+                raise ImageDatasetError("Microscopy metadata could not be read.")
             metadata = reader.metadata
             print_metadata(metadata)
             if args.structure:
+                inspect_structure = getattr(getattr(reader, "backend", None), "reader", None)
+                if inspect_structure is None or not hasattr(inspect_structure, "inspect_hdf5_structure"):
+                    raise ImageDatasetError("--structure is available only when the active backend is IMS.")
                 print("\nHDF5 structure:")
-                print(reader.inspect_hdf5_structure())
+                print(inspect_structure.inspect_hdf5_structure())
 
             export_requested = bool(args.channels) or args.merge
             if not export_requested:
@@ -174,8 +188,8 @@ def run(argv: list[str] | None = None) -> int:
             print("\nPPT summary:")
             print(summary_path.read_text(encoding="utf-8"))
             return 0
-    except (IMSReaderError, OSError, ValueError) as exc:
-        print("Unable to process IMS file.", file=sys.stderr)
+    except (DatasetLoaderError, ImageDatasetError, IMSReaderError, OSError, ValueError) as exc:
+        print("Unable to process microscopy file.", file=sys.stderr)
         print(f"Reason: {exc}", file=sys.stderr)
         return 1
 

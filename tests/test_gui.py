@@ -13,9 +13,9 @@ from PySide6.QtGui import QAction, QCursor, QDesktopServices, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTreeWidgetItem
 
-from iea.gui import ExportImageSettingsDialog, ExportWorker, IMSFigureExporterWindow
+from iea.gui import DatasetOpenWorker, ExportImageSettingsDialog, ExportWorker, IMSFigureExporterWindow
 from iea.gui_controls import PersistentSelectionMenu
-from iea.gui_window import GITHUB_REPOSITORY_URL
+from iea.gui_window import AUTO_MERGE_PREVIEW, GITHUB_REPOSITORY_URL
 from iea.ims_reader import IMSReader
 from iea.models import ChannelSelection, ExportSettings, ScaleBarSettings
 
@@ -229,6 +229,44 @@ def test_output_images_menu_selects_multiple_single_and_merge_outputs(
     assert application is not None
 
 
+def test_preview_defaults_to_colored_merge_and_follows_enabled_channels(
+    sample_three_channel_ims,
+    gui_settings,
+    monkeypatch,
+):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_three_channel_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+    captured_workers = []
+    monkeypatch.setattr(window, "_run_worker", lambda worker, _slot: captured_workers.append(worker))
+
+    assert window.preview_combo.currentData() == AUTO_MERGE_PREVIEW
+    assert window.preview_combo.currentText() == "Merge: Selected Channels — Green + Red/Marker + Blue"
+    window._start_preview(show_warnings=True)
+    assert captured_workers[-1].preview_selection == (0, 1, 2)
+
+    window.channel_controls[2].include.setChecked(False)
+    assert window.preview_combo.currentData() == AUTO_MERGE_PREVIEW
+    assert window.preview_combo.currentText() == "Merge: Selected Channels — Green + Red/Marker"
+    window._start_preview(show_warnings=True)
+    assert captured_workers[-1].preview_selection == (0, 1)
+
+    window.channel_controls[0].include.setChecked(False)
+    assert window.preview_combo.currentData() == AUTO_MERGE_PREVIEW
+    assert window.preview_combo.currentText() == "Merge: Selected Channels — Red/Marker"
+    window._start_preview(show_warnings=True)
+    assert captured_workers[-1].preview_selection == (1,)
+
+    window._preview_timer.stop()
+    window.close()
+    assert application is not None
+
+
 def test_objective_auto_detection_and_manual_override_reach_export_settings(sample_ims, gui_settings):
     application = QApplication.instance() or QApplication([])
     with IMSReader(sample_ims) as reader:
@@ -415,6 +453,28 @@ def test_open_multiple_files_defaults_to_process_and_export_all(sample_ims, tmp_
     assert len(window._selected_export_paths()) == 2
     window.close()
     assert application is not None
+
+
+def test_open_oib_uses_background_dataset_worker(tmp_path, monkeypatch, gui_settings):
+    QApplication.instance() or QApplication([])
+    oib = tmp_path / "sample.oib"
+    oib.write_bytes(b"placeholder")
+    window = IMSFigureExporterWindow(gui_settings)
+    captured = []
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(oib)], "OIB files"),
+    )
+    monkeypatch.setattr(window, "_run_worker", lambda worker, slot: captured.append((worker, slot)))
+
+    window.open_ims()
+
+    assert len(captured) == 1
+    assert isinstance(captured[0][0], DatasetOpenWorker)
+    assert captured[0][0].source_paths == (oib.resolve(),)
+    assert captured[0][1] == window._dataset_open_finished
+    window.close()
 
 
 def test_open_ims_dialog_remembers_last_successful_folder(sample_ims, tmp_path, monkeypatch):

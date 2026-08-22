@@ -153,7 +153,11 @@ class IMSReader:
             warnings.append("Image dimensions were missing; dataset storage was interpreted as Z, Y, X.")
             axis_order = ("Z", "Y", "X")
         else:
-            sizes, axis_order, size_warning = self._resolve_sizes_from_data(first_data.shape, reported_sizes)
+            sizes, axis_order, size_warning = self._resolve_sizes_from_data(
+                first_data.shape,
+                reported_sizes,
+                first_data.chunks,
+            )
             if size_warning:
                 warnings.append(size_warning)
         axis_warning = self._axis_ambiguity_warning(first_data.shape, sizes, axis_order)
@@ -177,7 +181,7 @@ class IMSReader:
             if data.ndim != 3:
                 raise IMSReaderError(f"Channel {index} is not a 3D stack.")
             self._validate_dtype(data.dtype)
-            channel_axis_order, channel_warning = self._infer_axis_order(data.shape, sizes)
+            channel_axis_order, channel_warning = self._infer_axis_order(data.shape, sizes, data.chunks)
             if channel_warning and channel_warning not in warnings:
                 warnings.append(channel_warning)
             channel_info = self._channel_info_group(dataset_info, index)
@@ -383,9 +387,21 @@ class IMSReader:
 
     @staticmethod
     def _resolve_sizes_from_data(
-        shape: tuple[int, ...], reported_sizes: dict[str, int]
+        shape: tuple[int, ...],
+        reported_sizes: dict[str, int],
+        chunks: tuple[int, ...] | None = None,
     ) -> tuple[dict[str, int], tuple[str, str, str], str | None]:
-        """Use ResolutionLevel 0 dimensions when one Image size attribute is stale."""
+        """Resolve logical dimensions, including ImarisWriter chunk padding."""
+
+        preferred = ("Z", "Y", "X")
+        if IMSReader._matches_chunk_padded_shape(shape, reported_sizes, preferred, chunks):
+            warning = None
+            if tuple(reported_sizes[axis] for axis in preferred) != tuple(shape):
+                warning = (
+                    f"ResolutionLevel 0 storage shape {tuple(shape)} includes HDF5 chunk padding; "
+                    "Image metadata dimensions are used for the logical image."
+                )
+            return dict(reported_sizes), preferred, warning
 
         scored_orders = [
             (
@@ -401,7 +417,6 @@ class IMSReader:
                 f"X={reported_sizes['X']}, Y={reported_sizes['Y']}, Z={reported_sizes['Z']}."
             )
         candidates = [order for score, order in scored_orders if score == best_score]
-        preferred = ("Z", "Y", "X")
         selected = preferred if preferred in candidates else candidates[0]
         resolved = {axis: int(shape[position]) for position, axis in enumerate(selected)}
         mismatches = [
@@ -433,11 +448,37 @@ class IMSReader:
         return None
 
     @staticmethod
-    def _infer_axis_order(shape: tuple[int, ...], sizes: dict[str, int]) -> tuple[tuple[str, str, str], str | None]:
+    def _matches_chunk_padded_shape(
+        shape: tuple[int, ...],
+        sizes: dict[str, int],
+        order: tuple[str, str, str],
+        chunks: tuple[int, ...] | None,
+    ) -> bool:
+        """Return true when storage is a chunk-rounded container for a logical image."""
+
+        if chunks is None or len(chunks) != 3:
+            return False
+        for position, axis in enumerate(order):
+            stored = int(shape[position])
+            logical = sizes[axis]
+            chunk = int(chunks[position])
+            if stored < logical:
+                return False
+            if stored != logical and (stored % chunk != 0 or stored - logical >= chunk):
+                return False
+        return True
+
+    @staticmethod
+    def _infer_axis_order(
+        shape: tuple[int, ...],
+        sizes: dict[str, int],
+        chunks: tuple[int, ...] | None = None,
+    ) -> tuple[tuple[str, str, str], str | None]:
         candidates = [
             order
             for order in itertools.permutations(("Z", "Y", "X"))
             if tuple(sizes[axis] for axis in order) == tuple(shape)
+            or IMSReader._matches_chunk_padded_shape(shape, sizes, order, chunks)
         ]
         if not candidates:
             raise IMSReaderError(
@@ -548,7 +589,8 @@ class IMSReader:
         channel = metadata.channels[channel_index]
         data = h5_file[channel.dataset_path]
         z_axis = channel.axis_order.index("Z")
-        selection: list[slice] = [slice(None), slice(None), slice(None)]
+        logical_sizes = {"X": metadata.size_x, "Y": metadata.size_y, "Z": metadata.size_z}
+        selection = [slice(0, logical_sizes[axis]) for axis in channel.axis_order]
         selection[z_axis] = slice(z_start - 1, z_end)
         selected = np.asarray(data[tuple(selection)])
         transpose_axes = tuple(channel.axis_order.index(axis) for axis in ("Z", "Y", "X"))
@@ -585,7 +627,8 @@ class IMSReader:
         data_max: float | None = None
         for chunk_start in range(z_start - 1, z_end, chunk_depth):
             chunk_end = min(chunk_start + chunk_depth, z_end)
-            selection: list[slice] = [slice(None), slice(None), slice(None)]
+            logical_sizes = {"X": metadata.size_x, "Y": metadata.size_y, "Z": metadata.size_z}
+            selection = [slice(0, logical_sizes[axis]) for axis in channel.axis_order]
             selection[z_axis] = slice(chunk_start, chunk_end)
             selected = np.asarray(data[tuple(selection)])
             chunk_zyx = np.transpose(selected, axes=transpose_axes)

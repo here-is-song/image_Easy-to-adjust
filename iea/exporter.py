@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import tifffile
@@ -14,7 +15,7 @@ from PIL import Image, ImageOps
 
 from .color_mapping import additive_merge, apply_pseudocolor, convert_red_to_magenta
 from .display_adjustment import apply_display_adjustment, resolve_display_range
-from .ims_reader import IMSReader, IMSReaderError
+from .ims_reader import IMSReaderError
 from .models import (
     ChannelMetadata,
     DisplayAdjustmentSettings,
@@ -24,6 +25,20 @@ from .models import (
 )
 from .objective_detector import apply_manual_objective, detect_objective
 from .scalebar import draw_scale_bar
+
+
+class ExportDataset(Protocol):
+    """Small format-neutral interface needed by the figure export pipeline."""
+
+    metadata: IMSMetadata | None
+
+    def project_z_range(
+        self,
+        channel_index: int,
+        z_start: int,
+        z_end: int,
+        chunk_depth: int = 8,
+    ) -> tuple[np.ndarray, float, float]: ...
 
 
 @dataclass(frozen=True)
@@ -103,7 +118,7 @@ def _available_path(path: Path) -> Path:
 
 
 def _project_and_adjust(
-    reader: IMSReader,
+    reader: ExportDataset,
     channel: ChannelMetadata,
     z_start: int,
     z_end: int,
@@ -126,7 +141,7 @@ def _project_and_adjust(
 
 
 def render_single_channel(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     channel_index: int,
     display_adjustment: DisplayAdjustmentSettings | None = None,
@@ -155,7 +170,7 @@ def render_single_channel(
 
 
 def render_merge(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> tuple[np.ndarray, tuple[ChannelExportRecord, ...]]:
@@ -172,7 +187,7 @@ def render_merge(
 
 
 def render_selected_channels(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
     channel_indices: tuple[int, ...] | None = None,
@@ -218,7 +233,7 @@ def merge_rendered_channels(
 
 
 def _export_rendered_single_channels(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
     output_directory: str | Path | None,
@@ -262,7 +277,7 @@ def _export_rendered_single_channels(
 
 
 def _export_rendered_merge(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     rendered: Mapping[int, tuple[np.ndarray, ChannelExportRecord]],
     output_directory: str | Path | None,
@@ -343,7 +358,7 @@ def _resize_for_output(
 
 def prepare_output_image(
     image: np.ndarray,
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
 ) -> tuple[np.ndarray, float | None]:
     """Resize a rendered image and draw its scale bar at final-output resolution."""
@@ -353,9 +368,16 @@ def prepare_output_image(
         return output_image, None
     if reader.metadata is None:
         raise IMSReaderError("IMS metadata is unavailable.")
+    source_voxel_size_x = reader.metadata.voxel_size_x_um
+    if reader.metadata.extent_x_um is not None:
+        source_voxel_size_x = reader.metadata.extent_x_um / image.shape[1]
+    if source_voxel_size_x is None:
+        raise IMSReaderError(
+            "PhysicalSizeX is unavailable; disable the scale bar or provide valid physical metadata."
+        )
     return draw_scale_bar(
         output_image,
-        voxel_size_x_um=(reader.metadata.extent_x_um / image.shape[1]) / scale_x,
+        voxel_size_x_um=source_voxel_size_x / scale_x,
         scale_bar_um=settings.scale_bar.length_um,
         thickness_px=settings.scale_bar.thickness_px,
         font_size_px=settings.scale_bar.font_size_px,
@@ -364,7 +386,7 @@ def prepare_output_image(
 
 
 def export_single_channels(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
@@ -379,7 +401,7 @@ def export_single_channels(
 
 
 def export_merge(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
@@ -394,7 +416,7 @@ def export_merge(
 
 
 def export_channels_and_merge(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
@@ -423,7 +445,7 @@ def export_channels_and_merge(
 
 
 def write_export_info(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     results: list[ExportResult],
     output_directory: str | Path | None = None,
@@ -458,14 +480,21 @@ def write_export_info(
     ]
     detected_objective = metadata.objective_detection or detect_objective(metadata)
     selected_objective = apply_manual_objective(detected_objective, settings.objective_override)
+    origin_z = metadata.origin_z_um
+    voxel_z = metadata.voxel_size_z_um
+    z_start_um = origin_z + (settings.z_start - 1) * voxel_z if origin_z is not None and voxel_z is not None else None
+    z_end_um = origin_z + (settings.z_end - 1) * voxel_z if origin_z is not None and voxel_z is not None else None
+    selected_thickness_um = (
+        (settings.z_end - settings.z_start + 1) * voxel_z if voxel_z is not None else None
+    )
     payload = {
         "source_file": metadata.source_path.name,
         "source_path": str(metadata.source_path),
         "z_start_slice": settings.z_start,
         "z_end_slice": settings.z_end,
-        "z_start_um": metadata.origin_z_um + (settings.z_start - 1) * metadata.voxel_size_z_um,
-        "z_end_um": metadata.origin_z_um + (settings.z_end - 1) * metadata.voxel_size_z_um,
-        "selected_thickness_um": (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um,
+        "z_start_um": z_start_um,
+        "z_end_um": z_end_um,
+        "selected_thickness_um": selected_thickness_um,
         "projection": "maximum",
         "scale_bar_um": scale_bar_um,
         "scale_bar_thickness_px": settings.scale_bar.thickness_px,
@@ -561,9 +590,12 @@ def format_ppt_summary(metadata: IMSMetadata, settings: ExportSettings) -> str:
     )
     if metadata.size_z == 1:
         image_depth_description = "single-layer image;"
+    elif metadata.voxel_size_z_um is None and selected.measured_z_spacing_um is None:
+        image_depth_description = "Z-sectioning information: Not available;"
     else:
-        selected_thickness = (settings.z_end - settings.z_start + 1) * metadata.voxel_size_z_um
         z_interval = selected.measured_z_spacing_um or metadata.voxel_size_z_um
+        assert z_interval is not None
+        selected_thickness = (settings.z_end - settings.z_start + 1) * z_interval
         image_depth_description = (
             f"Z-sectioning interval: {_summary_number(z_interval)} μm, "
             f"Z-stack thickness: {_summary_number(selected_thickness)} μm;"
@@ -578,7 +610,7 @@ def format_ppt_summary(metadata: IMSMetadata, settings: ExportSettings) -> str:
 
 
 def write_ppt_summary(
-    reader: IMSReader,
+    reader: ExportDataset,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
 ) -> Path:

@@ -21,6 +21,8 @@ class ChannelMetadata:
     axis_order: tuple[str, str, str]
     display_range_source: str = "ims"
     display_gamma_source: str = "ims"
+    excitation_wavelength_nm: float | None = None
+    emission_wavelength_nm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -84,22 +86,24 @@ class IMSMetadata:
     size_x: int
     size_y: int
     size_z: int
-    voxel_size_x_um: float
-    voxel_size_y_um: float
-    voxel_size_z_um: float
-    origin_x_um: float
-    origin_y_um: float
-    origin_z_um: float
-    extent_x_um: float
-    extent_y_um: float
-    extent_z_um: float
+    voxel_size_x_um: float | None
+    voxel_size_y_um: float | None
+    voxel_size_z_um: float | None
+    origin_x_um: float | None
+    origin_y_um: float | None
+    origin_z_um: float | None
+    extent_x_um: float | None
+    extent_y_um: float | None
+    extent_z_um: float | None
     unit: str
     dtype: str
     time_point_count: int
     channels: tuple[ChannelMetadata, ...]
+    source_format: str = "IMS"
     acquisition: AcquisitionMetadata = field(default_factory=AcquisitionMetadata)
     objective_detection: ObjectiveDetectionResult | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    raw_metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def channel_count(self) -> int:

@@ -51,7 +51,13 @@ from .exporter import default_output_directory
 from .fv1200_calibration import FV1200_OBJECTIVES
 from .gui_controls import CollapsibleSection, PersistentSelectionMenu
 from .gui_dialogs import ExportImageSettingsDialog
-from .gui_workers import BatchExportOutcome, ExportWorker, PreviewWorker
+from .gui_workers import (
+    BatchExportOutcome,
+    DatasetOpenOutcome,
+    DatasetOpenWorker,
+    ExportWorker,
+    PreviewWorker,
+)
 from .ims_reader import IMSReader, IMSReaderError
 from .models import (
     ChannelMetadata,
@@ -67,6 +73,7 @@ from .settings_store import SettingsStore
 from .theme import apply_dark_theme
 
 GITHUB_REPOSITORY_URL = "https://github.com/here-is-song/image_Easy-to-adjust"
+AUTO_MERGE_PREVIEW = "auto_merge"
 
 
 @dataclass
@@ -95,6 +102,7 @@ class IMSFigureExporterWindow(QMainWindow):
         stored = self.settings_store.load()
         self.metadata: IMSMetadata | None = None
         self.batch_metadata: dict[Path, IMSMetadata] = {}
+        self.batch_source_status: dict[Path, str] = {}
         self.channel_controls: dict[int, ChannelControls] = {}
         self.output_image_actions: dict[tuple[int, ...], QAction] = {}
         self.output_selection_name_groups: tuple[tuple[str, ...], ...] | None = None
@@ -137,7 +145,7 @@ class IMSFigureExporterWindow(QMainWindow):
         """Create a conventional menu structure that can grow with future features."""
 
         file_menu = self.menuBar().addMenu("&File")
-        self.open_action = QAction("Open IMS Files…", self)
+        self.open_action = QAction("Open Microscopy Files…", self)
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.open_action.triggered.connect(self.open_ims)
         file_menu.addAction(self.open_action)
@@ -233,7 +241,7 @@ class IMSFigureExporterWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         file_row = QHBoxLayout()
-        self.open_button = QPushButton("Open IMS Files…")
+        self.open_button = QPushButton("Open Microscopy Files…")
         self.open_button.clicked.connect(self.open_ims)
         self.file_label = QLabel("No IMS file selected")
         self.file_label.setWordWrap(True)
@@ -497,11 +505,15 @@ class IMSFigureExporterWindow(QMainWindow):
         )
         filenames, _ = QFileDialog.getOpenFileNames(
             self,
-            "Open IMS files",
+            "Open microscopy files",
             initial_directory,
-            "IMS files (*.ims);;All files (*)",
+            "Microscopy files (*.ims *.IMS *.oib *.OIB);;IMS files (*.ims *.IMS);;OIB files (*.oib *.OIB)",
         )
         if not filenames:
+            return
+        requested_paths = tuple(Path(filename).resolve() for filename in filenames)
+        if any(path.suffix.casefold() == ".oib" for path in requested_paths):
+            self._run_worker(DatasetOpenWorker(requested_paths), self._dataset_open_finished)
             return
         loaded: dict[Path, IMSMetadata] = {}
         errors: list[str] = []
@@ -514,13 +526,25 @@ class IMSFigureExporterWindow(QMainWindow):
                 errors.append(f"{Path(filename).name}: {exc}")
             finally:
                 reader.close()
-        if not loaded:
-            QMessageBox.critical(self, "Unable to open IMS files", "\n".join(errors))
-            return
+        self._apply_loaded_metadata(
+            loaded,
+            {path: "IMS opened directly; Auto Display Adjustment skipped." for path in loaded},
+            errors,
+        )
 
+    def _apply_loaded_metadata(
+        self,
+        loaded: dict[Path, IMSMetadata],
+        source_status: dict[Path, str],
+        errors: list[str] | tuple[str, ...],
+    ) -> None:
+        if not loaded:
+            QMessageBox.critical(self, "Unable to open microscopy files", "\n".join(errors))
+            return
         self.last_input_directory = next(iter(loaded)).parent
         self.settings_store.save_last_input_directory(self.last_input_directory)
         self.batch_metadata = loaded
+        self.batch_source_status = source_status
         self.output_selection_name_groups = None
         self.last_output_directory = None
         self.batch_tree.blockSignals(True)
@@ -537,22 +561,42 @@ class IMSFigureExporterWindow(QMainWindow):
         self.batch_tree.blockSignals(False)
         self.objective_combo.setCurrentIndex(0)
         first_path = Path(str(first_item.data(0, Qt.ItemDataRole.UserRole)))
-        self._activate_metadata(loaded[first_path])
+        self._activate_metadata(loaded[first_path], first_path)
         if errors:
             QMessageBox.warning(
                 self,
-                "Some IMS files were skipped",
+                "Some microscopy files were skipped",
                 "The following files could not be opened:\n" + "\n".join(errors),
             )
 
-    def _activate_metadata(self, metadata: IMSMetadata) -> None:
+    @Slot(object)
+    def _dataset_open_finished(self, outcome: object) -> None:
+        if not isinstance(outcome, DatasetOpenOutcome):
+            self._worker_failed("The dataset worker returned an unexpected result.")
+            return
+        loaded = {record.requested_path: record.metadata for record in outcome.records}
+        statuses = {
+            record.requested_path: " ".join(record.messages) or f"Backend: {record.active_backend}"
+            for record in outcome.records
+        }
+        self._apply_loaded_metadata(loaded, statuses, outcome.errors)
+
+    def _activate_metadata(self, metadata: IMSMetadata, requested_path: Path | None = None) -> None:
         self.metadata = metadata
-        self.file_label.setText(str(metadata.source_path))
+        active_path = requested_path or metadata.source_path
+        self.file_label.setText(str(active_path))
+        voxel_text = " x ".join(
+            f"{value:.6g}" if value is not None else "N/A"
+            for value in (
+                metadata.voxel_size_x_um,
+                metadata.voxel_size_y_um,
+                metadata.voxel_size_z_um,
+            )
+        )
         self.metadata_label.setText(
             f"{metadata.size_x} x {metadata.size_y} x {metadata.size_z} | "
             f"{metadata.channel_count} channels | "
-            f"{metadata.voxel_size_x_um:.6g} x {metadata.voxel_size_y_um:.6g} x "
-            f"{metadata.voxel_size_z_um:.6g} um"
+            f"{voxel_text} um"
         )
         self._update_warning_display(metadata.warnings)
         self._sync_output_folder_controls()
@@ -565,7 +609,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self._update_objective_display()
         self._update_export_enabled()
         self.refresh_preview_action.setEnabled(True)
-        self.status_label.setText(f"{len(self.batch_metadata)} IMS file(s) loaded. Active: {metadata.source_path.name}")
+        source_status = self.batch_source_status.get(active_path)
+        status_suffix = f" {source_status}" if source_status else ""
+        self.status_label.setText(
+            f"{len(self.batch_metadata)} microscopy file(s) loaded. Active: {active_path.name}.{status_suffix}"
+        )
         self._preview_timer.stop()
         self._preview_refresh_pending = False
         self.update_preview()
@@ -578,7 +626,7 @@ class IMSFigureExporterWindow(QMainWindow):
         path = Path(str(selected[0].data(0, Qt.ItemDataRole.UserRole)))
         metadata = self.batch_metadata.get(path)
         if metadata is not None and metadata is not self.metadata:
-            self._activate_metadata(metadata)
+            self._activate_metadata(metadata, path)
 
     @Slot(QTreeWidgetItem, int)
     def _batch_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
@@ -882,12 +930,24 @@ class IMSFigureExporterWindow(QMainWindow):
         self.preview_combo.clear()
         if self.metadata is not None:
             channel_names = {channel.index: channel.name for channel in self.metadata.channels}
+            enabled_channels = tuple(
+                channel.index
+                for channel in self.metadata.channels
+                if self.channel_controls[channel.index].include.isChecked()
+            )
+            if enabled_channels:
+                selected_label = " + ".join(channel_names[index] for index in enabled_channels)
+                self.preview_combo.addItem(
+                    f"Merge: Selected Channels — {selected_label}",
+                    AUTO_MERGE_PREVIEW,
+                )
             for group in self._selected_output_groups():
-                if len(group) > 1:
+                if len(group) > 1 and group != enabled_channels:
                     label = " + ".join(channel_names[index] for index in group)
                     self.preview_combo.addItem(f"Merge: {label}", group)
             for channel in self.metadata.channels:
-                self.preview_combo.addItem(channel.name, channel.index)
+                if channel.index in enabled_channels:
+                    self.preview_combo.addItem(f"Color: {channel.name}", (channel.index,))
         index = next(
             (
                 position
@@ -908,10 +968,18 @@ class IMSFigureExporterWindow(QMainWindow):
         start = self.z_start.value()
         end = self.z_end.value()
         voxel = self.metadata.voxel_size_z_um
+        if voxel is None:
+            self.z_info.setText(
+                f"Start: slice {start}\n"
+                f"End: slice {end}\n"
+                "Physical Z spacing: N/A"
+            )
+            return
         thickness = (end - start + 1) * voxel
+        origin_z = self.metadata.origin_z_um or 0.0
         self.z_info.setText(
-            f"Start: slice {start} ({self.metadata.origin_z_um + (start - 1) * voxel:.4g} um)\n"
-            f"End: slice {end} ({self.metadata.origin_z_um + (end - 1) * voxel:.4g} um)\n"
+            f"Start: slice {start} ({origin_z + (start - 1) * voxel:.4g} um)\n"
+            f"End: slice {end} ({origin_z + (end - 1) * voxel:.4g} um)\n"
             f"Selected thickness: {thickness:.4g} um"
         )
 
@@ -1079,14 +1147,16 @@ class IMSFigureExporterWindow(QMainWindow):
         selected_preview = self.preview_combo.currentData()
         if selected_preview is None:
             return
-        if isinstance(selected_preview, (tuple, list)):
-            preview_selection: int | tuple[int, ...] = tuple(int(index) for index in selected_preview)
+        if selected_preview == AUTO_MERGE_PREVIEW:
+            preview_selection: int | tuple[int, ...] = settings.channel_indices
+        elif isinstance(selected_preview, (tuple, list)):
+            preview_selection = tuple(int(index) for index in selected_preview)
         else:
-            preview_selection = int(selected_preview)
-        if isinstance(preview_selection, int) and preview_selection not in settings.channel_indices:
-            message = "Select this channel before previewing it."
+            preview_selection = (int(selected_preview),)
+        if not set(preview_selection).issubset(settings.channel_indices):
+            message = "Select all channels in this preview before displaying it."
             if show_warnings:
-                QMessageBox.warning(self, "Channel not selected", message)
+                QMessageBox.warning(self, "Channels not selected", message)
             else:
                 self.status_label.setText(message)
             return
@@ -1158,6 +1228,11 @@ class IMSFigureExporterWindow(QMainWindow):
             self.progress_bar.setRange(0, len(worker.source_paths))
             self.progress_bar.setValue(0)
             self.cancel_button.setEnabled(True)
+        elif isinstance(worker, DatasetOpenWorker):
+            worker.progress.connect(self._dataset_open_progress)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.cancel_button.setEnabled(True)
         else:
             self.progress_bar.setRange(0, 0)
             self.cancel_button.setEnabled(False)
@@ -1184,12 +1259,18 @@ class IMSFigureExporterWindow(QMainWindow):
         if filename and completed < total:
             self.status_label.setText(f"Processing {completed + 1} / {total}: {filename}")
 
+    @Slot(int, str)
+    def _dataset_open_progress(self, percent: int, phase: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(min(max(percent, 0), 100))
+        self.status_label.setText(phase)
+
     @Slot()
     def cancel_processing(self) -> None:
-        if isinstance(self._worker, ExportWorker):
+        if isinstance(self._worker, (ExportWorker, DatasetOpenWorker)):
             self._worker.cancel()
             self.cancel_button.setEnabled(False)
-            self.status_label.setText("Cancelling after the current file…")
+            self.status_label.setText("Cancelling safely…")
 
     @Slot(object)
     def _preview_finished(self, image: object) -> None:

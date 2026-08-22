@@ -2,6 +2,7 @@
 
 __version__ = "0.3.0"
 
+from .image_dataset import ImageDataset, ImageSession
 from .ims_reader import IMSReader, IMSReaderError
 
-__all__ = ["IMSReader", "IMSReaderError"]
+__all__ = ["IMSReader", "IMSReaderError", "ImageDataset", "ImageSession"]

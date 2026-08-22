@@ -2,6 +2,30 @@
 
 本文件记录 image_easy-to-adjust（IEA）的重要功能更新与修复。
 
+## 未发布
+
+### 新增功能
+
+- 新增 Olympus OIB 打开与同目录、同 basename IMS 持久缓存工作流；已有有效 IMS 时完全跳过 OIB 像素读取和 Auto Display。
+- 新增格式无关的 `ImageDataset / ImageSession`、Bio-Formats lazy/block 后端、IMS 后端适配器和 Memory 后端，为后续格式及分析模块保留统一接口。
+- 新增逐通道 Imaris-like Auto Display：第一个显著 histogram mode、P99.8 和 Gamma 1.0，采用有上限的 Z/XY 采样且不修改原始 voxel。
+- 接入官方 PyImarisWriter，以分块方式写入原始像素、物理尺度、通道名称/颜色及 Min/Max/Gamma；临时文件完成后再原子重命名。
+- OIB 转换使用 GUI 后台 worker，支持批量选择、进度显示、取消和安全错误清理。
+
+### 安全与兼容性
+
+- 损坏的同名 IMS 会安全回退到 OIB，且不会自动覆盖损坏缓存。
+- OIB 原文件始终只读；转换失败会删除临时 IMS。
+- IMSReader 支持识别并裁剪官方 ImarisWriter 的 HDF5 chunk padding，同时保留逻辑图像尺寸。
+- 增加 OIB 缓存 A–E、自动显示、统一数据集、流式写入及官方 writer 逐体素往返测试。
+
+### 修复
+
+- 修复 Bio-Formats 默认下载精简 JRE、缺少 `jar.exe` 而无法首次初始化的问题；现在默认使用完整 Java 11 JDK。
+- 修复 Windows 项目路径包含中文时，JPype 本地库无法被 JVM 加载的问题；仅将 Java bridge 镜像到 ASCII 临时目录，原始 OIB 不移动。
+- 修复 Bio-Formats JVM 与 PyImarisWriter 多线程同时存在时，单层 OIB 可能长期停留在 IMS finalize 的问题；缓存 writer 默认使用稳定的单线程模式。
+- 预览默认使用当前启用通道的彩色 Merge；调整 Channels 后会自动切换为对应三色、双色或单通道伪彩色预览，不再意外退回灰度图。
+
 ## v0.3.0 - 2026-08-20
 
 ### 新增功能

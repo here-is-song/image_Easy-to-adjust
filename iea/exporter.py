@@ -449,6 +449,8 @@ def write_export_info(
     settings: ExportSettings,
     results: list[ExportResult],
     output_directory: str | Path | None = None,
+    *,
+    original_metadata: IMSMetadata | None = None,
 ) -> Path:
     """Write a JSON record describing the exact settings used for an export."""
 
@@ -505,6 +507,19 @@ def write_export_info(
         "output_height_px": settings.output.height_px,
         "output_dpi": settings.output.dpi,
         "resize_mode": settings.output.resize_mode,
+        "physical_calibration": {
+            "source": _physical_calibration_payload(original_metadata or metadata),
+            "effective": _physical_calibration_payload(metadata),
+            "manual_correction": (
+                {
+                    "physical_width_um": settings.metadata_correction.physical_width_um,
+                    "physical_height_um": settings.metadata_correction.physical_height_um,
+                    "z_spacing_um": settings.metadata_correction.z_spacing_um,
+                }
+                if settings.metadata_correction is not None and not settings.metadata_correction.is_empty
+                else None
+            ),
+        },
         "single_channel_indices": list(settings.resolved_single_channel_indices),
         "merge_channel_indices": list(settings.resolved_merge_channel_indices),
         "merge_channel_groups": [list(group) for group in settings.resolved_merge_channel_groups],
@@ -531,6 +546,16 @@ def write_export_info(
     output_path = _available_path(output_dir / "export_info.json")
     output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return output_path
+
+
+def _physical_calibration_payload(metadata: IMSMetadata) -> dict[str, float | None]:
+    return {
+        "physical_width_um": metadata.extent_x_um,
+        "physical_height_um": metadata.extent_y_um,
+        "pixel_size_x_um": metadata.voxel_size_x_um,
+        "pixel_size_y_um": metadata.voxel_size_y_um,
+        "z_spacing_um": metadata.voxel_size_z_um,
+    }
 
 
 def _summary_number(value: float) -> str:

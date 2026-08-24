@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QSettings
 
-from .models import GuiPreferences, ImageOutputSettings
+from .models import GuiPreferences, ImageOutputSettings, MetadataCorrection
 
 SECTION_KEYS = ("batch_files", "channels", "z_range", "objective", "scale_bar")
 
@@ -102,8 +103,54 @@ class SettingsStore:
         self.settings.setValue("integration/fiji_directory", str(directory))
         self.settings.sync()
 
+    def load_metadata_corrections(self) -> dict[Path, MetadataCorrection]:
+        raw = str(self.settings.value("metadata/corrections", "")).strip()
+        if not raw:
+            return {}
+        try:
+            records = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        corrections: dict[Path, MetadataCorrection] = {}
+        if not isinstance(records, dict):
+            return corrections
+        for path_text, values in records.items():
+            if not isinstance(path_text, str) or not isinstance(values, dict):
+                continue
+            try:
+                correction = MetadataCorrection(
+                    physical_width_um=_positive_optional(values.get("physical_width_um")),
+                    physical_height_um=_positive_optional(values.get("physical_height_um")),
+                    z_spacing_um=_positive_optional(values.get("z_spacing_um")),
+                )
+            except (TypeError, ValueError):
+                continue
+            if not correction.is_empty:
+                corrections[Path(path_text)] = correction
+        return corrections
+
+    def save_metadata_corrections(self, corrections: dict[Path, MetadataCorrection]) -> None:
+        records = {
+            str(path): {
+                "physical_width_um": correction.physical_width_um,
+                "physical_height_um": correction.physical_height_um,
+                "z_spacing_um": correction.z_spacing_um,
+            }
+            for path, correction in corrections.items()
+            if not correction.is_empty
+        }
+        self.settings.setValue("metadata/corrections", json.dumps(records, ensure_ascii=False))
+        self.settings.sync()
+
     def save_section_expanded(self, section_key: str, expanded: bool) -> None:
         if section_key not in SECTION_KEYS:
             raise ValueError(f"Unknown collapsible section: {section_key}")
         self.settings.setValue(f"layout/sections/{section_key}/expanded", expanded)
         self.settings.sync()
+
+
+def _positive_optional(value: object) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    return number if number > 0 else None

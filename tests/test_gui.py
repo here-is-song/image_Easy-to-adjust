@@ -20,11 +20,12 @@ from iea.gui import (
     ExportImageSettingsDialog,
     ExportWorker,
     IMSFigureExporterWindow,
+    MetadataCorrectionDialog,
 )
 from iea.gui_controls import PersistentSelectionMenu
 from iea.gui_window import AUTO_MERGE_PREVIEW, GITHUB_REPOSITORY_URL
 from iea.ims_reader import IMSReader
-from iea.models import ChannelSelection, ExportSettings, ScaleBarSettings
+from iea.models import ChannelSelection, ExportSettings, MetadataCorrection, ScaleBarSettings
 from iea.plugins.cell_counting import load_cell_counting_plugins
 
 
@@ -75,6 +76,7 @@ def test_gui_window_constructs_without_a_display(gui_settings):
     assert window.export_action.shortcut().toString() == "Ctrl+C"
     assert window.reset_preview_view_action.shortcut().toString() == "Ctrl+B"
     assert not window.cell_count_demo_action.isEnabled()
+    assert not window.edit_metadata_action.isEnabled()
     assert not window.send_to_fiji_action.isEnabled()
     assert window.configure_fiji_action.isEnabled()
     assert not window.export_button.isEnabled()
@@ -387,6 +389,31 @@ def test_objective_auto_detection_and_manual_override_reach_export_settings(samp
     assert application is not None
 
 
+def test_metadata_correction_dialog_keeps_pixel_shape_read_only(sample_ims, gui_settings):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+    parent = IMSFigureExporterWindow(gui_settings)
+    dialog = MetadataCorrectionDialog(parent, metadata)
+
+    dialog.width_check.setChecked(True)
+    dialog.width_spin.setValue(500.0)
+    dialog.height_check.setChecked(True)
+    dialog.height_spin.setValue(400.0)
+    dialog.z_check.setChecked(True)
+    dialog.z_spin.setValue(3.5)
+    correction = dialog.correction()
+
+    assert correction == MetadataCorrection(500.0, 400.0, 3.5)
+    assert f"{500.0 / metadata.size_x:.6g} µm/px" in dialog.pixel_size_label.text()
+    dialog.restore_button.click()
+    assert dialog.correction().is_empty
+    dialog.close()
+    parent.close()
+    assert application is not None
+
+
 def test_selected_output_folder_is_passed_to_gui_export(sample_ims, tmp_path, monkeypatch, gui_settings):
     application = QApplication.instance() or QApplication([])
     with IMSReader(sample_ims) as reader:
@@ -479,6 +506,10 @@ def test_menu_settings_persist_between_windows(tmp_path):
     first.output_directory = tmp_path / "saved-output"
     first.fiji_directory = tmp_path / "Fiji.app"
     first.settings_store.save_fiji_directory(first.fiji_directory)
+    corrected_path = (tmp_path / "wrong-calibration.ims").resolve()
+    first.settings_store.save_metadata_corrections(
+        {corrected_path: MetadataCorrection(500.0, 400.0, 3.5)}
+    )
     first._save_export_settings()
     first.refresh_limit_actions[5000].trigger()
     first.close()
@@ -493,6 +524,7 @@ def test_menu_settings_persist_between_windows(tmp_path):
     assert second.copy_to_clipboard
     assert second.output_directory == tmp_path / "saved-output"
     assert second.fiji_directory == tmp_path / "Fiji.app"
+    assert second.metadata_corrections[corrected_path] == MetadataCorrection(500.0, 400.0, 3.5)
     assert second.preview_refresh_interval_ms == 5000
     assert second.refresh_limit_actions[5000].isChecked()
     second.close()

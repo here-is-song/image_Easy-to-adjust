@@ -17,7 +17,14 @@ from iea.exporter import (
     write_ppt_summary,
 )
 from iea.ims_reader import IMSReader
-from iea.models import DisplayAdjustmentSettings, ExportSettings, ImageOutputSettings, ScaleBarSettings
+from iea.metadata_correction import apply_metadata_correction
+from iea.models import (
+    DisplayAdjustmentSettings,
+    ExportSettings,
+    ImageOutputSettings,
+    MetadataCorrection,
+    ScaleBarSettings,
+)
 
 
 def test_single_channel_and_merge_tiff_exports(sample_ims, tmp_path):
@@ -125,6 +132,43 @@ def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     assert payload["objective_detection"]["normalized_fov_um"] == 6.0
     assert payload["objective_detection"]["expected_fov_um"] == 1271.809
     assert payload["selected_objective"]["objective_key"] == "10X"
+    assert payload["physical_calibration"]["manual_correction"] is None
+    assert payload["physical_calibration"]["source"] == payload["physical_calibration"]["effective"]
+
+
+def test_export_info_records_source_and_corrected_physical_calibration(sample_ims, tmp_path):
+    correction = MetadataCorrection(500.0, 400.0, 3.5)
+    settings = ExportSettings(
+        z_start=1,
+        z_end=1,
+        channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+        metadata_correction=correction,
+    )
+    with IMSReader(sample_ims) as reader:
+        original = reader.metadata
+        assert original is not None
+        reader.metadata = apply_metadata_correction(original, correction)
+        results = export_single_channels(reader, settings, tmp_path)
+        info_path = write_export_info(
+            reader,
+            settings,
+            results,
+            tmp_path,
+            original_metadata=original,
+        )
+
+    payload = json.loads(info_path.read_text(encoding="utf-8"))
+    calibration = payload["physical_calibration"]
+    assert calibration["source"]["physical_width_um"] == 2.5
+    assert calibration["effective"]["physical_width_um"] == 500.0
+    assert calibration["effective"]["pixel_size_x_um"] == 100.0
+    assert calibration["effective"]["z_spacing_um"] == 3.5
+    assert calibration["manual_correction"] == {
+        "physical_width_um": 500.0,
+        "physical_height_um": 400.0,
+        "z_spacing_um": 3.5,
+    }
 
 
 def test_ppt_summary_uses_source_acquisition_and_selected_z_range(sample_ims, tmp_path):

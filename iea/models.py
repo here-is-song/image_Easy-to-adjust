@@ -155,6 +155,22 @@ class ImageOutputSettings:
 
 
 @dataclass(frozen=True)
+class MetadataCorrection:
+    """Non-destructive physical calibration overrides for one source file."""
+
+    physical_width_um: float | None = None
+    physical_height_um: float | None = None
+    z_spacing_um: float | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return all(
+            value is None
+            for value in (self.physical_width_um, self.physical_height_um, self.z_spacing_um)
+        )
+
+
+@dataclass(frozen=True)
 class ExportSettings:
     """Scientific processing settings for one export operation.
 
@@ -171,6 +187,7 @@ class ExportSettings:
     single_channel_indices: tuple[int, ...] | None = None
     merge_channel_indices: tuple[int, ...] | None = None
     merge_channel_groups: tuple[tuple[int, ...], ...] | None = None
+    metadata_correction: MetadataCorrection | None = None
 
     @property
     def resolved_single_channel_indices(self) -> tuple[int, ...]:

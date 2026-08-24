@@ -1,6 +1,11 @@
 """Public GUI entry points for image_easy-to-adjust (IEA)."""
 
-from .gui_dialogs import CellCountingDemoDialog, CellCountingResultsDialog, ExportImageSettingsDialog
+from .gui_dialogs import (
+    CellCountingDemoDialog,
+    CellCountingResultsDialog,
+    ExportImageSettingsDialog,
+    MetadataCorrectionDialog,
+)
 from .gui_window import IMSFigureExporterWindow, launch_gui
 from .gui_workers import (
     BatchExportOutcome,
@@ -21,6 +26,7 @@ __all__ = [
     "ExportImageSettingsDialog",
     "ExportWorker",
     "IMSFigureExporterWindow",
+    "MetadataCorrectionDialog",
     "PreviewWorker",
     "launch_gui",
 ]

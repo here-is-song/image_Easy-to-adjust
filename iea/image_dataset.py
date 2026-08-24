@@ -198,6 +198,16 @@ class ImageDataset:
         self._metadata = replace(metadata, channels=channels)
         self._display_settings = settings
 
+    def apply_metadata(self, metadata: IMSMetadata) -> None:
+        """Attach corrected metadata while preserving the underlying pixel layout."""
+
+        current = self._require_metadata()
+        current_shape = (current.size_x, current.size_y, current.size_z, current.channel_count)
+        replacement_shape = (metadata.size_x, metadata.size_y, metadata.size_z, metadata.channel_count)
+        if replacement_shape != current_shape:
+            raise ImageDatasetError("Corrected metadata cannot change the stored pixel dimensions or channels.")
+        self._metadata = metadata
+
     def get_block(
         self,
         time_index: int,

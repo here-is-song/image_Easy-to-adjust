@@ -30,7 +30,8 @@ from .fiji_bridge import (
 )
 from .image_dataset import ImageDataset, ResolutionLevelInfo
 from .ims_reader import IMSReaderError
-from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings, IMSMetadata
+from .metadata_correction import apply_metadata_correction
+from .models import ChannelSelection, DisplayAdjustmentSettings, ExportSettings, IMSMetadata, MetadataCorrection
 from .plugins.cell_counting import (
     CellCountingRequest,
     CellCountingResult,
@@ -176,6 +177,7 @@ class PreviewWorker(QObject):
         preview_selection: int | tuple[int, ...],
         target_width: int = 1200,
         target_height: int = 1200,
+        metadata_correction: MetadataCorrection | None = None,
     ) -> None:
         super().__init__()
         self.source_path = source_path
@@ -184,6 +186,7 @@ class PreviewWorker(QObject):
         self.preview_selection = preview_selection
         self.target_width = max(1, int(target_width))
         self.target_height = max(1, int(target_height))
+        self.metadata_correction = metadata_correction
 
     @Slot()
     def run(self) -> None:
@@ -192,6 +195,7 @@ class PreviewWorker(QObject):
                 reader = session.dataset
                 if reader.metadata is None:
                     raise IMSReaderError("Microscopy metadata could not be read.")
+                reader.apply_metadata(apply_metadata_correction(reader.metadata, self.metadata_correction))
                 base_width = self.settings.output.width_px or reader.metadata.size_x
                 base_height = self.settings.output.height_px or reader.metadata.size_y
                 requested_factor = max(
@@ -321,6 +325,7 @@ class FijiBridgeWorker(QObject):
         channel_indices: tuple[int, ...],
         z_start: int,
         z_end: int,
+        metadata_correction: MetadataCorrection | None = None,
     ) -> None:
         super().__init__()
         self.source_path = source_path
@@ -328,6 +333,7 @@ class FijiBridgeWorker(QObject):
         self.channel_indices = channel_indices
         self.z_start = z_start
         self.z_end = z_end
+        self.metadata_correction = metadata_correction
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -338,6 +344,10 @@ class FijiBridgeWorker(QObject):
         try:
             output_path = make_bridge_output_path(self.source_path)
             with open_microscopy_dataset(self.source_path) as session:
+                metadata = session.dataset.metadata
+                if metadata is None:
+                    raise IMSReaderError("Microscopy metadata could not be read.")
+                session.dataset.apply_metadata(apply_metadata_correction(metadata, self.metadata_correction))
                 export_dataset_to_ome_tiff(
                     session.dataset,
                     output_path,
@@ -368,12 +378,16 @@ class ExportWorker(QObject):
         settings: ExportSettings,
         channel_selections: tuple[ChannelSelection, ...],
         output_directory: Path | None,
+        metadata_corrections: Mapping[Path, MetadataCorrection] | None = None,
     ) -> None:
         super().__init__()
         self.source_paths = source_paths
         self.settings = settings
         self.channel_selections = channel_selections
         self.output_directory = output_directory
+        self.metadata_corrections = {
+            path.resolve(): correction for path, correction in (metadata_corrections or {}).items()
+        }
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -396,7 +410,14 @@ class ExportWorker(QObject):
                     reader = session.dataset
                     if reader.metadata is None:
                         raise IMSReaderError("Microscopy metadata could not be read.")
+                    original_metadata = reader.metadata
+                    correction = self.metadata_corrections.get(source_path.resolve())
+                    reader.apply_metadata(apply_metadata_correction(original_metadata, correction))
                     matched = adapt_settings_for_metadata(self.settings, self.channel_selections, reader.metadata)
+                    matched = replace(
+                        matched,
+                        settings=replace(matched.settings, metadata_correction=correction),
+                    )
                     if not matched.settings.required_output_channel_indices:
                         raise IMSReaderError("None of the requested output channels exist in this file.")
                     warnings.extend(f"{source_path.name}: {message}" for message in matched.warnings)
@@ -406,7 +427,13 @@ class ExportWorker(QObject):
                         self.output_directory,
                         display_adjustments=matched.display_adjustments,
                     )
-                    info_path = write_export_info(reader, matched.settings, results, self.output_directory)
+                    info_path = write_export_info(
+                        reader,
+                        matched.settings,
+                        results,
+                        self.output_directory,
+                        original_metadata=original_metadata,
+                    )
                     summary_path = write_ppt_summary(reader, matched.settings, self.output_directory)
                     all_results.extend(results)
                     info_paths.append(info_path)

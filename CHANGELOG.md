@@ -16,12 +16,14 @@
 - 新增可扩展的细胞计数插件接口和 `Threshold + connected components (Demo)`，支持多检测/测量通道、全图/自动/手动画框 ROI、细胞标签 Overlay、阳性统计和 CSV 导出，并为后续 Cellpose 插件复用统一 label image 约定。
 - 新增外部 Fiji Bridge：将当前勾选通道和 Z 范围流式导出为保留原始强度与物理标定的 OME-TIFF，再由独立 Fiji 进程打开。
 - Fiji Bridge 支持自动发现及记忆 Fiji 安装目录、后台进度和安全取消；无需把 Fiji 移入项目或与 IEA 共用 Java 进程。
+- `File > Edit Image Metadata` 支持按文件非破坏地修正物理视野宽高和 Z spacing，自动换算 µm/pixel，并同步作用于比例尺、物镜辅助判断、导出、PPT 摘要和 Fiji 标定。
 
 ### 界面与交互改进
 
 - 预览状态会显示实际使用的金字塔层级；屏幕缩放、平移和旋转不会改变最终导出内容。
 - `Analysis` 菜单新增细胞计数 Demo 和 Fiji Bridge，Fiji 安装位置可在菜单中重新指定。
 - 细胞计数结果窗口同时显示细胞边界、中心点、ROI、各通道阳性汇总和逐细胞测量结果。
+- 手动物理标定会按源文件路径记忆，可一键恢复源 metadata；导出记录同时保存 source、effective 和 manual correction。
 
 ### 安全与兼容性
 

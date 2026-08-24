@@ -167,6 +167,8 @@ Windows 下推荐双击项目目录中的 `image_easy-to-adjust.lnk` 启动；�
 
 菜单栏末尾的 `Help > Open GitHub Repository` 会在默认浏览器中打开项目仓库；`Help > About IEA` 显示软件版本、作者与 Codex 协作说明、联系邮箱和源代码地址。
 
+`File > Edit Image Metadata…` 用于非破坏地修正当前文件的物理标定。实际像素宽高、Z 层数、通道数和数据类型由存储数据决定，因此保持只读；可以单独覆盖物理视野宽度、物理视野高度和 Z spacing，程序会自动换算 X/Y 的 µm/pixel。修正会按源文件路径记忆，并用于 Preview 比例尺、物镜辅助判断、最终导出、PPT 摘要和 Fiji OME-TIFF。点击 `Use Source Metadata` 可恢复源文件记录值。IEA 不会写回或修改原始 IMS/OIB；`export_info.json` 会同时记录 source、effective 和 manual correction，便于追溯。
+
 界面支持打开 IMS、查看 metadata、选择通道和 1-based Z 范围、修改每个通道的 Display Min/Max/Gamma、切换 Merge/单通道预览、自动或手动比例尺，以及红色转品红色。`Channels` 中通道名称旁的复选框控制该通道是否参与处理；菜单栏的 `Output Images` 是本次导出图片清单，按 `Three-color Merge`、`Two-color Merge` 和 `Single-color` 分类列出所有可选通道组合，每项都可以独立勾选。勾选子选项后菜单会保持展开，便于连续选择；鼠标移出整个菜单和子菜单区域后自动收起。一次导出可以同时生成多个不同 Merge 和指定单通道图，例如同时勾选红+蓝、绿+红、绿+红+蓝和绿色单通道；相同清单会按通道名称应用到所有批量文件。每张 Merge 使用包含通道名称的文件名，例如 `sample_Merge_Green_Red.tif`。Preview 下拉框会列出当前选中的各张 Merge，方便逐一检查。每个通道的 Min、Max 和 Gamma 都同时提供精确数值框与横向滑块；任一方式调整后都会触发受刷新频率限制的预览更新。Gamma 范围与 Imaris 一致，为 `0.1–5.0`。预览和导出都在后台线程运行，避免大文件计算时冻结界面。
 
 当 IMS 没有记录通道颜色时，程序会识别常用染料名称：`Alexa Fluor 488` 使用绿色、`Alexa Fluor 594` 使用红色、`DRAQ5` 使用蓝色。`Channels` 模块底部的 `Convert red to magenta` 开启时，会把红色通道转换为品红色，并同时作用于预览和导出；关闭后保持原始红色。IMS 读取警告显示在窗口左下方，并用四个空格连接为单行，鼠标悬停时也可查看完整内容。

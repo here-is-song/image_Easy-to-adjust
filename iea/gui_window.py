@@ -52,7 +52,12 @@ from .exporter import default_output_directory
 from .fiji_bridge import FijiBridgeError, discover_fiji_installation, resolve_fiji_executable
 from .fv1200_calibration import FV1200_OBJECTIVES
 from .gui_controls import CollapsibleSection, InteractivePreviewLabel, PersistentSelectionMenu
-from .gui_dialogs import CellCountingDemoDialog, CellCountingResultsDialog, ExportImageSettingsDialog
+from .gui_dialogs import (
+    CellCountingDemoDialog,
+    CellCountingResultsDialog,
+    ExportImageSettingsDialog,
+    MetadataCorrectionDialog,
+)
 from .gui_workers import (
     BatchExportOutcome,
     CellCountWorker,
@@ -66,6 +71,7 @@ from .gui_workers import (
 )
 from .image_dataset import ResolutionLevelInfo
 from .ims_reader import IMSReader, IMSReaderError
+from .metadata_correction import apply_metadata_correction
 from .models import (
     ChannelMetadata,
     ChannelSelection,
@@ -73,6 +79,7 @@ from .models import (
     ExportSettings,
     ImageOutputSettings,
     IMSMetadata,
+    MetadataCorrection,
     ScaleBarSettings,
 )
 from .objective_detector import apply_manual_objective, detect_objective
@@ -110,6 +117,10 @@ class IMSFigureExporterWindow(QMainWindow):
         stored = self.settings_store.load()
         self.metadata: IMSMetadata | None = None
         self.batch_metadata: dict[Path, IMSMetadata] = {}
+        self.source_metadata: dict[Path, IMSMetadata] = {}
+        self.metadata_corrections: dict[Path, MetadataCorrection] = (
+            self.settings_store.load_metadata_corrections()
+        )
         self.batch_source_status: dict[Path, str] = {}
         self.channel_controls: dict[int, ChannelControls] = {}
         self.output_image_actions: dict[tuple[int, ...], QAction] = {}
@@ -172,6 +183,11 @@ class IMSFigureExporterWindow(QMainWindow):
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.open_action.triggered.connect(self.open_ims)
         file_menu.addAction(self.open_action)
+
+        self.edit_metadata_action = QAction("Edit Image Metadata…", self)
+        self.edit_metadata_action.setEnabled(False)
+        self.edit_metadata_action.triggered.connect(self.edit_image_metadata)
+        file_menu.addAction(self.edit_metadata_action)
 
         self.open_output_action = QAction("Open Output Folder", self)
         self.open_output_action.setEnabled(False)
@@ -595,9 +611,15 @@ class IMSFigureExporterWindow(QMainWindow):
         if not loaded:
             QMessageBox.critical(self, "Unable to open microscopy files", "\n".join(errors))
             return
+        original_loaded = dict(loaded)
+        loaded = {
+            path: apply_metadata_correction(metadata, self.metadata_corrections.get(path.resolve()))
+            for path, metadata in loaded.items()
+        }
         self.last_input_directory = next(iter(loaded)).parent
         self.settings_store.save_last_input_directory(self.last_input_directory)
         self.batch_metadata = loaded
+        self.source_metadata = original_loaded
         self.batch_source_status = source_status
         self.output_selection_name_groups = None
         self.last_output_directory = None
@@ -659,6 +681,14 @@ class IMSFigureExporterWindow(QMainWindow):
             f"{metadata.size_x} x {metadata.size_y} x {metadata.size_z} | "
             f"{metadata.channel_count} channels | "
             f"{voxel_text} um"
+            + (
+                " | Manual physical calibration"
+                if (
+                    self.metadata_corrections.get(active_path.resolve()) is not None
+                    and not self.metadata_corrections[active_path.resolve()].is_empty
+                )
+                else ""
+            )
         )
         self._update_warning_display(metadata.warnings)
         self._sync_output_folder_controls()
@@ -673,6 +703,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self.refresh_preview_action.setEnabled(True)
         self.cell_count_demo_action.setEnabled(True)
         self.send_to_fiji_action.setEnabled(True)
+        self.edit_metadata_action.setEnabled(True)
         source_status = self.batch_source_status.get(active_path)
         status_suffix = f" {source_status}" if source_status else ""
         self.status_label.setText(
@@ -681,6 +712,33 @@ class IMSFigureExporterWindow(QMainWindow):
         self._preview_timer.stop()
         self._preview_refresh_pending = False
         self.update_preview()
+
+    @Slot()
+    def edit_image_metadata(self) -> None:
+        active_path = self._active_source_path()
+        if active_path is None or self.metadata is None:
+            return
+        resolved_path = active_path.resolve()
+        source = self.source_metadata.get(active_path) or self.source_metadata.get(resolved_path) or self.metadata
+        dialog = MetadataCorrectionDialog(
+            self,
+            source,
+            self.metadata_corrections.get(resolved_path),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        correction = dialog.correction()
+        if correction.is_empty:
+            self.metadata_corrections.pop(resolved_path, None)
+            status = "Source physical metadata restored."
+        else:
+            self.metadata_corrections[resolved_path] = correction
+            status = "Manual physical metadata correction applied."
+        self.settings_store.save_metadata_corrections(self.metadata_corrections)
+        effective = apply_metadata_correction(source, None if correction.is_empty else correction)
+        self.batch_metadata[active_path] = effective
+        self._activate_metadata(effective, active_path)
+        self.status_label.setText(f"{status} Original microscopy file was not modified.")
 
     @Slot()
     def _batch_selection_changed(self) -> None:
@@ -1227,13 +1285,15 @@ class IMSFigureExporterWindow(QMainWindow):
         if self.preview_pixmap is None:
             self._set_initial_preview_zoom()
         target_width, target_height = self._preview_target_size()
+        active_path = self._active_source_path() or self.metadata.source_path
         worker = PreviewWorker(
-            self.metadata.source_path,
+            active_path,
             settings,
             self._display_adjustments(),
             preview_selection,
             target_width,
             target_height,
+            self.metadata_corrections.get(active_path.resolve()),
         )
         self._run_worker(worker, self._preview_finished)
 
@@ -1284,6 +1344,7 @@ class IMSFigureExporterWindow(QMainWindow):
             settings,
             self._channel_selections(),
             self.output_directory,
+            self.metadata_corrections,
         )
         self._run_worker(worker, self._export_finished)
 
@@ -1357,6 +1418,7 @@ class IMSFigureExporterWindow(QMainWindow):
             settings.channel_indices,
             settings.z_start,
             settings.z_end,
+            self.metadata_corrections.get(source_path.resolve()),
         )
         self._run_worker(worker, self._fiji_bridge_finished)
 
@@ -1394,6 +1456,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self._worker = worker
         self.open_button.setEnabled(False)
         self.open_action.setEnabled(False)
+        self.edit_metadata_action.setEnabled(False)
         self.batch_tree.setEnabled(False)
         self.export_settings_action.setEnabled(False)
         self.output_images_menu.setEnabled(False)
@@ -1744,6 +1807,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self._worker = None
         self.open_button.setEnabled(True)
         self.open_action.setEnabled(True)
+        self.edit_metadata_action.setEnabled(self.metadata is not None)
         self.batch_tree.setEnabled(True)
         self.export_settings_action.setEnabled(True)
         self.output_images_menu.setEnabled(self.metadata is not None)

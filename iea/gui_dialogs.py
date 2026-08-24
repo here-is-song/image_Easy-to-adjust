@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import IMSMetadata
+from .models import IMSMetadata, MetadataCorrection
 from .plugins.cell_counting import (
     CellCountingRequest,
     CellCountingResult,
@@ -39,6 +39,153 @@ from .plugins.cell_counting import (
     NormalizedROI,
     write_cell_count_csv,
 )
+
+
+class MetadataCorrectionDialog(QDialog):
+    """Edit physical calibration while keeping stored pixel dimensions read-only."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        metadata: IMSMetadata,
+        correction: MetadataCorrection | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.metadata = metadata
+        self.setWindowTitle("Edit Image Metadata")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        root = QVBoxLayout(self)
+
+        explanation = QLabel(
+            "Corrections are saved by IEA for this file and used for preview, scale bars, export, "
+            "objective checking, and Fiji. The source IMS/OIB is never modified."
+        )
+        explanation.setWordWrap(True)
+        root.addWidget(explanation)
+
+        stored_group = QGroupBox("Stored pixel data (read-only)")
+        stored_form = QFormLayout(stored_group)
+        stored_form.addRow("Pixel dimensions:", QLabel(f"{metadata.size_x} × {metadata.size_y} px"))
+        stored_form.addRow("Z / Channels:", QLabel(f"{metadata.size_z} slices / {metadata.channel_count} channels"))
+        stored_form.addRow("Data type:", QLabel(metadata.dtype))
+        root.addWidget(stored_group)
+
+        calibration_group = QGroupBox("Manual physical calibration")
+        calibration_form = QFormLayout(calibration_group)
+        self.width_check, self.width_spin = self._calibration_control(
+            "Override",
+            correction.physical_width_um if correction else None,
+            self._source_width_um(),
+        )
+        self.height_check, self.height_spin = self._calibration_control(
+            "Override",
+            correction.physical_height_um if correction else None,
+            self._source_height_um(),
+        )
+        self.z_check, self.z_spin = self._calibration_control(
+            "Override",
+            correction.z_spacing_um if correction else None,
+            metadata.voxel_size_z_um,
+        )
+        calibration_form.addRow("Physical width:", self._control_row(self.width_check, self.width_spin))
+        calibration_form.addRow("Physical height:", self._control_row(self.height_check, self.height_spin))
+        calibration_form.addRow("Z spacing:", self._control_row(self.z_check, self.z_spin))
+        self.pixel_size_label = QLabel()
+        calibration_form.addRow("Effective pixel size:", self.pixel_size_label)
+        root.addWidget(calibration_group)
+
+        note = QLabel(
+            "Choose values from a trusted acquisition record or a calibration image. "
+            "Objective name can still be selected separately in the Objective panel."
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.restore_button = buttons.addButton(
+            "Use Source Metadata",
+            QDialogButtonBox.ButtonRole.ResetRole,
+        )
+        self.restore_button.clicked.connect(self._restore_source)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        for spin in (self.width_spin, self.height_spin):
+            spin.valueChanged.connect(self._update_pixel_size_label)
+        for check in (self.width_check, self.height_check):
+            check.toggled.connect(self._update_pixel_size_label)
+        self._update_pixel_size_label()
+
+    @staticmethod
+    def _control_row(check: QCheckBox, spin: QDoubleSpinBox) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(check)
+        layout.addWidget(spin, 1)
+        return widget
+
+    @staticmethod
+    def _calibration_control(
+        label: str,
+        override: float | None,
+        source: float | None,
+    ) -> tuple[QCheckBox, QDoubleSpinBox]:
+        check = QCheckBox(label)
+        check.setChecked(override is not None)
+        spin = QDoubleSpinBox()
+        spin.setDecimals(6)
+        spin.setRange(0.000001, 1_000_000_000.0)
+        spin.setSuffix(" µm")
+        spin.setValue(override if override is not None else source if source is not None else 1.0)
+        spin.setEnabled(check.isChecked())
+        check.toggled.connect(spin.setEnabled)
+        return check, spin
+
+    def _source_width_um(self) -> float | None:
+        if self.metadata.extent_x_um is not None:
+            return self.metadata.extent_x_um
+        if self.metadata.voxel_size_x_um is not None:
+            return self.metadata.voxel_size_x_um * self.metadata.size_x
+        return None
+
+    def _source_height_um(self) -> float | None:
+        if self.metadata.extent_y_um is not None:
+            return self.metadata.extent_y_um
+        if self.metadata.voxel_size_y_um is not None:
+            return self.metadata.voxel_size_y_um * self.metadata.size_y
+        return None
+
+    def _effective_width_um(self) -> float | None:
+        return self.width_spin.value() if self.width_check.isChecked() else self._source_width_um()
+
+    def _effective_height_um(self) -> float | None:
+        return self.height_spin.value() if self.height_check.isChecked() else self._source_height_um()
+
+    @Slot()
+    def _update_pixel_size_label(self) -> None:
+        width = self._effective_width_um()
+        height = self._effective_height_um()
+        x_text = f"{width / self.metadata.size_x:.6g} µm/px" if width is not None else "Unknown"
+        y_text = f"{height / self.metadata.size_y:.6g} µm/px" if height is not None else "Unknown"
+        self.pixel_size_label.setText(f"X: {x_text}    Y: {y_text}")
+
+    @Slot()
+    def _restore_source(self) -> None:
+        self.width_check.setChecked(False)
+        self.height_check.setChecked(False)
+        self.z_check.setChecked(False)
+        self._update_pixel_size_label()
+
+    def correction(self) -> MetadataCorrection:
+        return MetadataCorrection(
+            physical_width_um=self.width_spin.value() if self.width_check.isChecked() else None,
+            physical_height_um=self.height_spin.value() if self.height_check.isChecked() else None,
+            z_spacing_um=self.z_spin.value() if self.z_check.isChecked() else None,
+        )
 
 
 class ExportImageSettingsDialog(QDialog):

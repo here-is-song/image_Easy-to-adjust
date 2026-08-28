@@ -302,7 +302,7 @@ class IMSFigureExporterWindow(QMainWindow):
         file_row = QHBoxLayout()
         self.open_button = QPushButton("Open Microscopy Files…")
         self.open_button.clicked.connect(self.open_ims)
-        self.file_label = QLabel("No IMS file selected")
+        self.file_label = QLabel("No microscopy file selected")
         self.file_label.setWordWrap(True)
         file_row.addWidget(self.open_button)
         file_row.addWidget(self.file_label, 1)
@@ -329,7 +329,7 @@ class IMSFigureExporterWindow(QMainWindow):
         batch_layout = QVBoxLayout()
         self.batch_tree = QTreeWidget()
         self.batch_tree.setColumnCount(3)
-        self.batch_tree.setHeaderLabels(["IMS file", "Process", "Export"])
+        self.batch_tree.setHeaderLabels(["Microscopy file", "Process", "Export"])
         self.batch_tree.setMinimumHeight(130)
         self.batch_tree.setRootIsDecorated(False)
         self.batch_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -577,12 +577,13 @@ class IMSFigureExporterWindow(QMainWindow):
             self,
             "Open microscopy files",
             initial_directory,
-            "Microscopy files (*.ims *.IMS *.oib *.OIB);;IMS files (*.ims *.IMS);;OIB files (*.oib *.OIB)",
+            "Microscopy files (*.ims *.IMS *.oib *.OIB *.tif *.TIF *.tiff *.TIFF);;"
+            "IMS files (*.ims *.IMS);;OIB files (*.oib *.OIB);;TIFF files (*.tif *.TIF *.tiff *.TIFF)",
         )
         if not filenames:
             return
         requested_paths = tuple(Path(filename).resolve() for filename in filenames)
-        if any(path.suffix.casefold() == ".oib" for path in requested_paths):
+        if any(path.suffix.casefold() != ".ims" for path in requested_paths):
             self._run_worker(DatasetOpenWorker(requested_paths), self._dataset_open_finished)
             return
         loaded: dict[Path, IMSMetadata] = {}
@@ -1846,7 +1847,8 @@ class IMSFigureExporterWindow(QMainWindow):
             f"<h3>image_easy-to-adjust (IEA)</h3>"
             f"<p>Version {__version__}</p>"
             "<p>This open-source software was developed by Song Xuanyu with assistance from Codex.</p>"
-            "<p>IEA is designed for simple batch processing of IMS files and is currently developed primarily "
+            "<p>IEA is designed for simple batch processing of microscopy image files and is currently "
+            "developed primarily "
             "to meet the author's own workflow needs.</p>"
             '<p>Contact: <a href="mailto:songxuanyuhappy@gmail.com">songxuanyuhappy@gmail.com</a></p>'
             f'<p>Source code: <a href="{GITHUB_REPOSITORY_URL}">{GITHUB_REPOSITORY_URL}</a></p>',

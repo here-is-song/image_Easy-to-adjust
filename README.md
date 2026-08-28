@@ -1,6 +1,6 @@
 # image_easy-to-adjust (IEA)
 
-这是一个面向 Windows 的桌面和命令行工具，用于打开 Olympus `.oib` 和 Bitplane Imaris `.ims` 显微镜文件，并把指定通道和 Z 范围导出为论文制图用 TIFF 或 PNG。当前支持 OIB 自动建立同名 IMS 缓存、单文件和批量处理、可调预览、比例尺、导出尺寸/DPI 与可复现导出记录；不包含 3D 渲染、细胞分割或计数。
+这是一个面向 Windows 的桌面和命令行工具，用于打开 TIFF/OME-TIFF、Olympus `.oib` 和 Bitplane Imaris `.ims` 显微镜文件，并把指定通道和 Z 范围导出为论文制图用 TIFF 或 PNG。当前支持 OIB 自动建立同名 IMS 缓存、单文件和批量处理、可调预览、比例尺、导出尺寸/DPI 与可复现导出记录；不包含 3D 渲染。
 
 当前版本为 `v0.3.0`，详细变化请参阅 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -55,6 +55,12 @@ OIB 始终只读。第一次转换后的当前会话继续使用 Bio-Formats 数
 
 首次 OIB 转换会逐通道执行 Imaris-like Auto Display：均匀抽取最多 32 个 Z 平面和有限数量 XY 像素；Min 使用对零峰、坏点和极端值有保护的第一个显著直方图 mode，失败时记录日志并回退到 P0.5；Max 使用采样 P99.8；Gamma 为 `1.0`。这些值只是显示映射，写入 IMS 的仍是未归一化、未缩放、未转换类型的原始 voxel。
 
+## TIFF / OME-TIFF 读取
+
+GUI 和 CLI 可直接打开 `.tif` 和 `.tiff`，支持单层灰度、RGB、普通多页 Z-stack，以及常见的多通道 OME-TIFF。TIFF 不会被转换为 IMS 缓存，原文件始终只读。程序优先读取 OME `PhysicalSizeX/Y/Z`，其次读取标准 TIFF `XResolution/YResolution/ResolutionUnit` 或 ImageJ 标定。缺少可靠的 X/Y 标定时不会猜测比例尺，可用 `File > Edit Image Metadata…` 手动填写实际视野宽高。
+
+大多数普通 TIFF 不包含完整显微镜字段；此时 IEA 会使用实验流程默认值 `Olympus MVX10`、`MV PLAPO 2XC`、`Zoom 1.25X`，并在界面警告中提醒导出前核对。如果 OME-TIFF 已明确记录其他显微镜或物镜，则优先使用文件自身信息。当前读取第一个 TIFF image series；不含原生金字塔的 TIFF 会把该 series 载入内存，因此超大文件需要留意内存占用。
+
 ## Milestone 1：检查 IMS metadata
 
 ```powershell
@@ -89,7 +95,7 @@ python main.py D:\data\sample.ims --channel 0 --channel 2 --z-start 10 --z-end 4
 
 ## Milestone 3：比例尺
 
-比例尺默认开启，使用 X 方向体素尺寸计算。自动长度最接近图像物理宽度的 15%，候选为 1、2、5、10、20、50、100、200、500、1000 µm。
+比例尺默认开启，使用 X 方向体素尺寸计算。自动长度最接近图像物理宽度的 15%，候选从 1 µm 扩展到 50 mm。长度达到 1000 µm 时会自动改用 mm 显示，例如 `1000 µm` 写为 `1 mm`、`1500 µm` 写为 `1.5 mm`。
 
 指定 50 µm 或关闭比例尺：
 
@@ -201,6 +207,8 @@ IEA 会记住 Fiji 安装目录，并会自动检查用户目录及 Windows 各�
 
 批量处理时，通道和 Display Min/Max/Gamma 会优先按通道名称匹配，而不是直接套用通道编号。因此，即使不同文件中的通道排列顺序不同，参数仍会应用到同名通道。遇到缺失或重名通道时，程序会显示警告并跳过无法可靠匹配的项。
 
+TIFF/OME-TIFF 与 IMS/OIB 一样可从 `File > Open Microscopy Files` 批量选择，也会记住最近一次成功打开文件的文件夹。
+
 ### FV1200 物镜自动识别
 
 打开 IMS 后，`Objective` 折叠分组会显示自动检测结果、NA、浸液类型、Z spacing、XY FOV、来源和置信度。检测顺序为：原文件明确记录的物镜信息优先；多层文件其次使用标准化 Z voxel depth；单层文件或 Z 证据无效时，使用图片像素尺寸、物理比例（µm/pixel）和 ScanZoom 计算 `长轴物理视野 × ScanZoom`，再与实验室 FV1200 的 ScanZoom 1.0 视野校准比较。仅有 `512 × 512` 或 `1024 × 1024` 等像素尺寸、没有物理比例或 ScanZoom 时不会猜测物镜。相对误差不超过 3% 为 High，3%–7% 为 Medium，超过 7% 不自动确认；候选过于接近时会降低置信度或要求手动确认。Z spacing 与 XY FOV 结论冲突时仍保留优先级更高的 Z 结果，但降为 Medium 并提示手动核对。
@@ -211,7 +219,7 @@ IEA 会记住 Fiji 安装目录，并会自动检查用户目录及 Windows 各�
 
 `Export > Export Images` 用于执行导出，快捷键为 `Ctrl+C`。导出过程中窗口底部会显示进度；可以点击 `Cancel`，程序会在当前文件处理完成后停止，并保留此前已经成功导出的文件。启用 `Copy merged image to Clipboard after export` 后，导出完成时会把合并图复制到剪贴板；批量导出时复制最后一张成功导出的合并图。如果本次只选择单通道输出、没有生成 Merge，程序会跳过剪贴板复制并明确提示。各通道图和合并图仍会正常保存到文件夹中。
 
-比例尺可在界面中启用或关闭，并可选择自动长度或手动长度。GUI 默认使用 `Bar thickness: 10 px` 和 `Text size: 50 px`；两个字段仍可手动修改，设为 `Auto` 时则由程序自动计算。程序会按字体的实际边界移动文字和比例尺，防止大字号文字超出图像；请求字号大到无法容纳时，会自动使用能够完整显示的最大字号。比例尺会同时出现在预览和最终导出图中。
+比例尺可在界面中启用或关闭，并可选择自动长度或手动长度。GUI 默认使用 `Bar thickness: 10 px` 和 `Text size: 50 px`；两个字段仍可手动修改，设为 `Auto` 时则由程序自动计算。程序会按字体的实际边界移动文字和比例尺，防止大字号文字超出图像；请求字号大到无法容纳时，会自动使用能够完整显示的最大字号。比例尺会同时出现在预览和最终导出图中；标签会根据长度自动使用 `µm` 或 `mm`。
 
 CLI 示例：
 
@@ -223,7 +231,7 @@ python main.py sample.ims --channel 0 --merge --format png --scale-bar-thickness
 
 每次图像导出会在同一输出文件夹额外生成 `export_info.json`，记录输出格式、像素尺寸、DPI、源文件、Z 范围及物理位置、投影方式、比例尺及其粗细和文字大小、红转品红设置、每个通道实际使用的 Min/Max/Gamma、原始/输出颜色、所有单通道及 Merge 通道组合和输出文件路径。CLI 与 GUI 都会生成该记录。
 
-每个 IMS 文件还会生成一个 `<源文件名>_PPT_summary.txt`，用于直接复制到 PowerPoint。PPT 摘要中的显微镜名称固定为实验室实际使用的 `Olympus FV1200`；原始 IMS 记录的厂家和型号仍保留在 `export_info.json`。程序会读取原始采集日期和像素扫描速度，物镜使用 GUI 最终选择（Auto 或手动覆盖）。对于多层 IMS，Z 间隔使用本次检测所采用的标准化 voxel depth，并结合所选 Z 范围计算导出堆栈厚度；对于原文件本身只有一个 Z 层的 IMS，摘要只写 `single-layer image`，不显示 Z 间隔或堆栈厚度。无法可靠识别的字段会显示为 `Not available`，不会根据文件名猜测。单文件 GUI 导出完成后，摘要内容也会直接显示在完成提示中。
+每个源文件还会生成一个 `<源文件名>_PPT_summary.txt`，用于直接复制到 PowerPoint。IMS/OIB 工作流程使用 `Olympus FV1200`；缺少仪器 metadata 的 TIFF 使用 `Olympus MVX10`、`MV PLAPO 2XC` 和 `Zoom 1.25X`。如果 OME-TIFF 已明确记录其他仪器，会使用文件中的值。程序会读取原始采集日期和像素扫描速度。对于多层文件，结合所选 Z 范围计算导出堆栈厚度；对于只有一个 Z 层的文件，摘要只写 `single-layer image`。无法可靠识别的字段会显示为 `Not available`，不会根据文件名猜测。单文件 GUI 导出完成后，摘要内容也会直接显示在完成提示中。
 
 ```text
 Date: 260806
@@ -248,7 +256,8 @@ iea/
   fv1200_calibration.py  FV1200 固定物镜 calibration profile
   objective_detector.py 独立物镜检测与手动覆盖逻辑
   image_dataset.py     统一 ImageDataset / ImageSession 和分块像素接口
-  dataset_loader.py    IMS 优先加载与同名 OIB 缓存流程
+  dataset_loader.py    IMS/OIB/TIFF 统一加载与 OIB 缓存流程
+  tiff_backend.py      TIFF/OME-TIFF 轴、通道和物理标定读取
   bioformats_reader.py Bio-Formats OIB lazy/block reader
   java_runtime.py      Windows Java/JPype 中文路径兼容层
   ims_backend.py       现有 IMSReader 的统一后端适配器

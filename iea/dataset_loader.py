@@ -18,6 +18,7 @@ from .image_dataset import (
 )
 from .imaris_writer import IMSWriterBackend
 from .ims_backend import IMSPixelBackend
+from .tiff_backend import TIFFPixelBackend
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,11 +54,13 @@ class DatasetLoader:
         self,
         ims_backend_factory: BackendFactory = IMSPixelBackend,
         oib_backend_factory: BackendFactory = BioFormatsBackend,
+        tiff_backend_factory: BackendFactory = TIFFPixelBackend,
         auto_display: ImarisLikeAutoDisplay | None = None,
         writer: IMSWriterBackend | None = None,
     ) -> None:
         self.ims_backend_factory = ims_backend_factory
         self.oib_backend_factory = oib_backend_factory
+        self.tiff_backend_factory = tiff_backend_factory
         self.auto_display = auto_display or ImarisLikeAutoDisplay()
         self.writer = writer or IMSWriterBackend()
 
@@ -91,6 +94,24 @@ class DatasetLoader:
                 cache_path=None,
                 active_backend=dataset.active_backend,
                 messages=("IMS opened directly; Auto Display Adjustment skipped.",),
+            )
+        if suffix in {".tif", ".tiff"}:
+            report(0.05, "Opening TIFF...")
+            dataset = self._open_tiff(requested)
+            report(1.0, "TIFF opened")
+            return ImageSession(
+                dataset=dataset,
+                relationship=DatasetFileRelationship(
+                    original_path=requested,
+                    cache_path=None,
+                    source_format="TIFF",
+                    cache_format=None,
+                    cache_status="not_applicable",
+                ),
+                original_source_path=requested,
+                cache_path=None,
+                active_backend=dataset.active_backend,
+                messages=("TIFF opened directly; source pixels were not modified.",),
             )
         if suffix != ".oib":
             raise DatasetLoaderError(f"Unsupported microscopy file type: {requested.suffix or '(none)'}")
@@ -227,6 +248,15 @@ class DatasetLoader:
 
     def _open_ims(self, path: Path) -> ImageDataset:
         dataset = ImageDataset(self.ims_backend_factory(path), "IMS")
+        try:
+            dataset.open()
+        except Exception:
+            dataset.close()
+            raise
+        return dataset
+
+    def _open_tiff(self, path: Path) -> ImageDataset:
+        dataset = ImageDataset(self.tiff_backend_factory(path), "TIFF")
         try:
             dataset.open()
         except Exception:

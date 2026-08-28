@@ -6,6 +6,9 @@
 
 ### 新增功能
 
+- 新增 TIFF/OME-TIFF 直接读取，支持单层灰度、RGB、普通多页 Z-stack 和常见多通道轴顺序，可在 GUI、CLI、批量预览、导出、计数 Demo 与 Fiji Bridge 中统一使用。
+- TIFF 优先读取 OME 物理尺寸，并兼容标准 TIFF/ImageJ resolution 标定；缺少仪器信息时，PPT 摘要默认使用 `Olympus MVX10`、`MV PLAPO 2XC` 和 `Zoom 1.25X`。
+- 比例尺长度达到 1000 µm 时自动换用 mm，例如以 `1 mm` 取代 `1000 µm`，并扩展大视野自动比例尺候选值。
 - 新增 Olympus OIB 打开与同目录、同 basename IMS 持久缓存工作流；已有有效 IMS 时完全跳过 OIB 像素读取和 Auto Display。
 - 新增格式无关的 `ImageDataset / ImageSession`、Bio-Formats lazy/block 后端、IMS 后端适配器和 Memory 后端，为后续格式及分析模块保留统一接口。
 - 新增逐通道 Imaris-like Auto Display：第一个显著 histogram mode、P99.8 和 Gamma 1.0，采用有上限的 Z/XY 采样且不修改原始 voxel。
@@ -27,6 +30,8 @@
 
 ### 安全与兼容性
 
+- 普通 TIFF 缺少 X/Y 物理标定时不会猜测比例尺，会明确提示使用 `File > Edit Image Metadata…` 核对。
+- RGB TIFF 按 Red/Green/Blue 样本顺序建立通道，避免套用荧光通道默认颜色而串色。
 - 损坏的同名 IMS 会安全回退到 OIB，且不会自动覆盖损坏缓存。
 - OIB 原文件始终只读；转换失败会删除临时 IMS。
 - IMSReader 支持识别并裁剪官方 ImarisWriter 的 HDF5 chunk padding，同时保留逻辑图像尺寸。
@@ -42,7 +47,7 @@
 ### 验证
 
 - 使用真实三通道 IMS 样本验证 Fiji OME-TIFF 桥接、通道顺序和物理标定。
-- 自动化测试扩展至 101 项，全部通过。
+- 自动化测试扩展至 115 项，全部通过。
 
 ## v0.3.0 - 2026-08-20
 

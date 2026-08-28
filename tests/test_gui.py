@@ -102,7 +102,7 @@ def test_help_menu_opens_repository_and_shows_about_information(gui_settings, mo
     assert about_calls[0][1] == "About IEA"
     assert "Song Xuanyu" in about_calls[0][2]
     assert "Codex" in about_calls[0][2]
-    assert "simple batch processing of IMS files" in about_calls[0][2]
+    assert "simple batch processing of microscopy image files" in about_calls[0][2]
     assert "author's own workflow needs" in about_calls[0][2]
     assert "songxuanyuhappy@gmail.com" in about_calls[0][2]
     assert "Version 0.3.0" in about_calls[0][2]
@@ -599,6 +599,28 @@ def test_open_oib_uses_background_dataset_worker(tmp_path, monkeypatch, gui_sett
     assert len(captured) == 1
     assert isinstance(captured[0][0], DatasetOpenWorker)
     assert captured[0][0].source_paths == (oib.resolve(),)
+    assert captured[0][1] == window._dataset_open_finished
+    window.close()
+
+
+def test_open_tiff_uses_background_dataset_worker(tmp_path, monkeypatch, gui_settings):
+    QApplication.instance() or QApplication([])
+    tiff = tmp_path / "sample.tif"
+    tiff.write_bytes(b"placeholder")
+    window = IMSFigureExporterWindow(gui_settings)
+    captured = []
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(tiff)], "TIFF files"),
+    )
+    monkeypatch.setattr(window, "_run_worker", lambda worker, slot: captured.append((worker, slot)))
+
+    window.open_ims()
+
+    assert len(captured) == 1
+    assert isinstance(captured[0][0], DatasetOpenWorker)
+    assert captured[0][0].source_paths == (tiff.resolve(),)
     assert captured[0][1] == window._dataset_open_finished
     window.close()
 

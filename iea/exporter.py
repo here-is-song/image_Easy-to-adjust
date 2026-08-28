@@ -584,13 +584,28 @@ def _objective_result_payload(objective: ObjectiveDetectionResult) -> dict[str, 
     }
 
 
-def _summary_microscope(_metadata: IMSMetadata) -> str:
-    """Use the laboratory microscope name requested for presentation summaries."""
+def _summary_microscope(metadata: IMSMetadata) -> str:
+    """Use the configured laboratory microscope for each source workflow."""
 
+    if metadata.source_format.casefold() == "tiff":
+        manufacturer = metadata.acquisition.microscope_manufacturer
+        model = metadata.acquisition.microscope_model
+        if manufacturer and model:
+            return f"{manufacturer} {model}"
+        return manufacturer or model or "Olympus MVX10"
     return "Olympus FV1200"
 
 
 def _summary_objective(metadata: IMSMetadata, settings: ExportSettings) -> str:
+    if metadata.source_format.casefold() == "tiff":
+        acquisition = metadata.acquisition
+        objective = acquisition.objective_name
+        if not objective and acquisition.objective_magnification is not None:
+            objective = f"{_summary_number(acquisition.objective_magnification)}X"
+        objective = objective or "MV PLAPO 2XC"
+        if acquisition.scan_zoom is not None:
+            objective += f", Zoom: {_summary_number(acquisition.scan_zoom)}X"
+        return objective
     detected = metadata.objective_detection or detect_objective(metadata)
     selected = apply_manual_objective(detected, settings.objective_override)
     if selected.objective_key is None:

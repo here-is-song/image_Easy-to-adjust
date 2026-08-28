@@ -19,6 +19,11 @@ SCALE_BAR_CANDIDATES_UM: tuple[float, ...] = (
     200,
     500,
     1000,
+    2000,
+    5000,
+    10000,
+    20000,
+    50000,
 )
 
 
@@ -41,6 +46,18 @@ def scale_bar_pixels(scale_bar_um: float, voxel_size_x_um: float) -> int:
     if scale_bar_um <= 0 or voxel_size_x_um <= 0:
         raise ValueError("Scale-bar length and X voxel size must be positive.")
     return max(1, int(round(scale_bar_um / voxel_size_x_um)))
+
+
+def format_scale_bar_length(scale_bar_um: float) -> str:
+    """Use millimetres for bars of at least 1000 µm."""
+
+    if not np.isfinite(scale_bar_um) or scale_bar_um <= 0:
+        raise ValueError("Scale-bar length must be positive.")
+    if scale_bar_um >= 1000:
+        value = scale_bar_um / 1000
+        text = f"{value:g}"
+        return f"{text} mm"
+    return f"{scale_bar_um:g} µm"
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -126,8 +143,7 @@ def draw_scale_bar(
         raise ValueError("Scale-bar font size must be positive when specified.")
     thickness = int(thickness_px) if thickness_px is not None else max(3, int(round(content_height * 0.004)))
     font_size = int(font_size_px) if font_size_px is not None else max(10, int(round(content_height * 0.035)))
-    label_value = int(chosen_um) if chosen_um.is_integer() else chosen_um
-    label = f"{label_value} µm"
+    label = format_scale_bar_length(chosen_um)
     gap = max(2, thickness)
     available_width = content_width - 2 * margin_x
     available_height = content_height - 2 * margin_y

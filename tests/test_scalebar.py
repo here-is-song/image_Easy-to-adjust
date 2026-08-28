@@ -1,6 +1,12 @@
 import numpy as np
+import pytest
 
-from iea.scalebar import choose_auto_scale_bar_um, draw_scale_bar, scale_bar_pixels
+from iea.scalebar import (
+    choose_auto_scale_bar_um,
+    draw_scale_bar,
+    format_scale_bar_length,
+    scale_bar_pixels,
+)
 
 
 def test_scale_bar_pixel_length():
@@ -9,6 +15,14 @@ def test_scale_bar_pixel_length():
 
 def test_auto_scale_bar_uses_nearest_candidate():
     assert choose_auto_scale_bar_um(width_pixels=2048, voxel_size_x_um=0.284) == 100
+
+
+@pytest.mark.parametrize(
+    ("length_um", "expected"),
+    [(500, "500 µm"), (1000, "1 mm"), (1500, "1.5 mm"), (5000, "5 mm")],
+)
+def test_scale_bar_label_uses_a_readable_unit(length_um, expected):
+    assert format_scale_bar_length(length_um) == expected
 
 
 def test_draw_scale_bar_preserves_shape_dtype_and_input():

@@ -22,13 +22,19 @@ from .models import (
     IMSMetadata,
     ScaleBarSettings,
 )
+from .scalebar import format_scale_bar_length
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect an OIB/IMS microscopy file and export publication image projections."
+        description="Inspect an OIB/IMS/TIFF microscopy file and export publication image projections."
     )
-    parser.add_argument("ims_file", type=Path, nargs="?", help="Path to a source .ims or .oib file")
+    parser.add_argument(
+        "ims_file",
+        type=Path,
+        nargs="?",
+        help="Path to a source .ims, .oib, .tif, or .tiff file",
+    )
     parser.add_argument(
         "--structure",
         action="store_true",
@@ -181,7 +187,11 @@ def run(argv: list[str] | None = None) -> int:
             summary_path = write_ppt_summary(reader, settings, args.output_dir)
             print("\nExport completed:")
             for result in results:
-                scale = f", scale bar {result.scale_bar_um:g} um" if result.scale_bar_um else ""
+                scale = (
+                    f", scale bar {format_scale_bar_length(result.scale_bar_um)}"
+                    if result.scale_bar_um
+                    else ""
+                )
                 print(f"  {result.path} — shape {result.shape}, dtype {result.dtype}{scale}")
             print(f"  {info_path} - export settings record")
             print(f"  {summary_path} - PPT acquisition summary")

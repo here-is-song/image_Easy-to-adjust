@@ -74,6 +74,7 @@ class PreviewRenderResult:
     full_size: tuple[int, int]
     level: ResolutionLevelInfo
     available_levels: tuple[ResolutionLevelInfo, ...]
+    baked_rotation_degrees: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,8 @@ class PreviewWorker(QObject):
         target_width: int = 1200,
         target_height: int = 1200,
         metadata_correction: MetadataCorrection | None = None,
+        view_rotation_degrees: float | None = None,
+        output_zoom_factor: float | None = None,
     ) -> None:
         super().__init__()
         self.source_path = source_path
@@ -187,6 +190,10 @@ class PreviewWorker(QObject):
         self.target_width = max(1, int(target_width))
         self.target_height = max(1, int(target_height))
         self.metadata_correction = metadata_correction
+        requested_rotation = settings.rotation_degrees if view_rotation_degrees is None else view_rotation_degrees
+        self.view_rotation_degrees = _normalized_rotation(requested_rotation)
+        requested_zoom = settings.zoom_factor if output_zoom_factor is None else output_zoom_factor
+        self.output_zoom_factor = max(0.02, min(16.0, float(requested_zoom)))
 
     @Slot()
     def run(self) -> None:
@@ -233,6 +240,8 @@ class PreviewWorker(QObject):
                         thickness_px=scaled_thickness,
                         font_size_px=scaled_font_size,
                     ),
+                    rotation_degrees=self.view_rotation_degrees,
+                    zoom_factor=self.output_zoom_factor,
                 )
                 if isinstance(self.preview_selection, tuple):
                     preview_settings = replace(preview_settings, merge_channel_indices=self.preview_selection)
@@ -251,10 +260,16 @@ class PreviewWorker(QObject):
                         (base_width, base_height),
                         level,
                         reader.resolution_levels(),
+                        self.view_rotation_degrees,
                     )
                 )
         except Exception as exc:  # Convert worker exceptions into a GUI error message.
             self.failed.emit(str(exc))
+
+
+def _normalized_rotation(degrees: float) -> float:
+    normalized = float(degrees) % 360.0
+    return normalized - 360.0 if normalized > 180.0 else normalized
 
 
 class CellCountWorker(QObject):

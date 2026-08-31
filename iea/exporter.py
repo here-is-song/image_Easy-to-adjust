@@ -64,6 +64,7 @@ class ChannelExportRecord:
     gamma: float
     original_color: tuple[float, float, float]
     output_color: tuple[float, float, float]
+    color_overridden: bool = False
 
 
 def sanitize_filename_component(value: str) -> str:
@@ -157,6 +158,8 @@ def render_single_channel(
     image, display_min, display_max, gamma = _project_and_adjust(
         reader, channel, settings.z_start, settings.z_end, display_adjustment
     )
+    color_override = display_adjustment.color if display_adjustment is not None else None
+    display_color = color_override or channel.color
     record = ChannelExportRecord(
         index=channel.index,
         name=channel.name,
@@ -164,7 +167,8 @@ def render_single_channel(
         display_max=display_max,
         gamma=gamma,
         original_color=channel.color,
-        output_color=channel.color,
+        output_color=display_color,
+        color_overridden=color_override is not None,
     )
     return image, record
 
@@ -216,7 +220,11 @@ def merge_rendered_channels(
         raise IMSReaderError("At least one channel must be selected for the merge overlay.")
     for channel_index in selected_indices:
         grayscale, record = rendered[channel_index]
-        output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
+        output_color = (
+            record.output_color
+            if record.color_overridden
+            else convert_red_to_magenta(record.output_color, settings.red_to_magenta)
+        )
         pseudocolor_images.append(apply_pseudocolor(grayscale, output_color))
         records.append(
             ChannelExportRecord(
@@ -227,6 +235,7 @@ def merge_rendered_channels(
                 gamma=record.gamma,
                 original_color=record.original_color,
                 output_color=output_color,
+                color_overridden=record.color_overridden,
             )
         )
     return additive_merge(pseudocolor_images), tuple(records)
@@ -248,8 +257,12 @@ def _export_rendered_single_channels(
     results: list[ExportResult] = []
     for channel_index in settings.resolved_single_channel_indices:
         adjusted, record = rendered[channel_index]
-        if output_format == "png":
-            output_color = convert_red_to_magenta(record.original_color, settings.red_to_magenta)
+        if output_format == "png" or record.color_overridden:
+            output_color = (
+                record.output_color
+                if record.color_overridden
+                else convert_red_to_magenta(record.output_color, settings.red_to_magenta)
+            )
             adjusted = additive_merge([apply_pseudocolor(adjusted, output_color)])
             record = ChannelExportRecord(
                 index=record.index,
@@ -259,6 +272,7 @@ def _export_rendered_single_channels(
                 gamma=record.gamma,
                 original_color=record.original_color,
                 output_color=output_color,
+                color_overridden=record.color_overridden,
             )
         output_image, chosen_scale = prepare_output_image(adjusted, reader, settings)
         filename = f"{source_name}_{sanitize_filename_component(record.name)}.{output_format}"
@@ -361,9 +375,16 @@ def prepare_output_image(
     reader: ExportDataset,
     settings: ExportSettings,
 ) -> tuple[np.ndarray, float | None]:
-    """Resize a rendered image and draw its scale bar at final-output resolution."""
+    """Apply view geometry, resize, then draw the scale bar at output resolution."""
 
-    output_image, scale_x, content_box = _resize_for_output(image, settings)
+    zoom_factor = float(settings.zoom_factor)
+    rotation_degrees = float(settings.rotation_degrees)
+    if not np.isfinite(zoom_factor) or zoom_factor <= 0:
+        raise IMSReaderError("Image zoom must be a positive finite number.")
+    if not np.isfinite(rotation_degrees):
+        raise IMSReaderError("Image rotation must be a finite number of degrees.")
+    transformed_image = _apply_geometric_transform(image, zoom_factor, rotation_degrees)
+    output_image, scale_x, content_box = _resize_for_output(transformed_image, settings)
     if not settings.scale_bar.enabled:
         return output_image, None
     if reader.metadata is None:
@@ -375,6 +396,18 @@ def prepare_output_image(
         raise IMSReaderError(
             "PhysicalSizeX is unavailable; disable the scale bar or provide valid physical metadata."
         )
+    source_voxel_size_y = reader.metadata.voxel_size_y_um
+    if reader.metadata.extent_y_um is not None:
+        source_voxel_size_y = reader.metadata.extent_y_um / image.shape[0]
+    if source_voxel_size_y is not None and rotation_degrees % 180.0 != 0:
+        radians = np.deg2rad(rotation_degrees)
+        source_voxel_size_x = float(
+            np.hypot(
+                np.cos(radians) * source_voxel_size_x,
+                np.sin(radians) * source_voxel_size_y,
+            )
+        )
+    source_voxel_size_x /= zoom_factor
     return draw_scale_bar(
         output_image,
         voxel_size_x_um=source_voxel_size_x / scale_x,
@@ -385,13 +418,47 @@ def prepare_output_image(
     )
 
 
+def _apply_geometric_transform(
+    image: np.ndarray,
+    zoom_factor: float,
+    rotation_degrees: float,
+) -> np.ndarray:
+    """Rotate with an expanded canvas, then zoom around the image centre."""
+
+    pil_image = Image.fromarray(image)
+    normalized_rotation = rotation_degrees % 360.0
+    if normalized_rotation:
+        pil_image = pil_image.rotate(
+            -normalized_rotation,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor=0,
+        )
+    if abs(zoom_factor - 1.0) < 1e-9:
+        return np.asarray(pil_image).copy()
+    canvas_width, canvas_height = pil_image.size
+    scaled_width = max(1, round(canvas_width * zoom_factor))
+    scaled_height = max(1, round(canvas_height * zoom_factor))
+    scaled = pil_image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+    if zoom_factor > 1.0:
+        left = max(0, (scaled_width - canvas_width) // 2)
+        top = max(0, (scaled_height - canvas_height) // 2)
+        transformed = scaled.crop((left, top, left + canvas_width, top + canvas_height))
+    else:
+        transformed = Image.new(pil_image.mode, (canvas_width, canvas_height), color=0)
+        left = (canvas_width - scaled_width) // 2
+        top = (canvas_height - scaled_height) // 2
+        transformed.paste(scaled, (left, top))
+    return np.asarray(transformed).copy()
+
+
 def export_single_channels(
     reader: ExportDataset,
     settings: ExportSettings,
     output_directory: str | Path | None = None,
     display_adjustments: Mapping[int, DisplayAdjustmentSettings] | None = None,
 ) -> list[ExportResult]:
-    """Export channels as grayscale TIFF or RGB pseudocolor PNG images."""
+    """Export channels as grayscale TIFF or RGB pseudocolor images when color is requested."""
 
     single_indices = settings.resolved_single_channel_indices
     if not single_indices:
@@ -477,6 +544,7 @@ def write_export_info(
             "gamma": record.gamma,
             "original_color": list(record.original_color),
             "output_color": list(record.output_color),
+            "color_overridden": record.color_overridden,
         }
         for record in channel_records
     ]
@@ -507,6 +575,8 @@ def write_export_info(
         "output_height_px": settings.output.height_px,
         "output_dpi": settings.output.dpi,
         "resize_mode": settings.output.resize_mode,
+        "zoom_factor": settings.zoom_factor,
+        "rotation_degrees": settings.rotation_degrees,
         "physical_calibration": {
             "source": _physical_calibration_payload(original_metadata or metadata),
             "effective": _physical_calibration_payload(metadata),

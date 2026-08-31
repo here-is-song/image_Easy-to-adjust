@@ -8,11 +8,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
+import tifffile
 from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QSettings, Qt
-from PySide6.QtGui import QAction, QCursor, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTreeWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QColorDialog, QFileDialog, QMessageBox, QTreeWidgetItem, QWidget
 
 from iea.gui import (
     CellCountingDemoDialog,
@@ -21,11 +22,20 @@ from iea.gui import (
     ExportWorker,
     IMSFigureExporterWindow,
     MetadataCorrectionDialog,
+    PreviewWorker,
 )
 from iea.gui_controls import PersistentSelectionMenu
 from iea.gui_window import AUTO_MERGE_PREVIEW, GITHUB_REPOSITORY_URL
+from iea.gui_workers import PreviewRenderResult
+from iea.image_dataset import ResolutionLevelInfo
 from iea.ims_reader import IMSReader
-from iea.models import ChannelSelection, ExportSettings, MetadataCorrection, ScaleBarSettings
+from iea.models import (
+    ChannelSelection,
+    ExportSettings,
+    ImageOutputSettings,
+    MetadataCorrection,
+    ScaleBarSettings,
+)
 from iea.plugins.cell_counting import load_cell_counting_plugins
 
 
@@ -158,10 +168,12 @@ def test_preview_zoom_changes_display_but_not_source_pixmap(gui_settings):
     assert window.preview_label.pixmap().size().width() == 200
     assert window.preview_label.pixmap().size().height() == 160
     assert window.preview_pixmap.size() == original_size
+    assert window.output_zoom_factor == 1.0
+    assert window.output_zoom_input.value() == 100.0
     window.close()
 
 
-def test_preview_pan_rotate_and_zoom_are_view_only(gui_settings):
+def test_preview_pan_and_wheel_zoom_are_view_only_while_rotation_updates_output(gui_settings):
     application = QApplication.instance() or QApplication([])
     window = IMSFigureExporterWindow(gui_settings)
     window.resize(700, 500)
@@ -184,6 +196,8 @@ def test_preview_pan_rotate_and_zoom_are_view_only(gui_settings):
 
     assert window.preview_rotation_degrees == 30.0
     assert window.preview_zoom == pytest.approx(1.875)
+    assert window.output_zoom_input.value() == 100.0
+    assert window.rotation_input.value() == pytest.approx(30.0)
     assert window.preview_pixmap.size().width() == 1000
     assert window.preview_pixmap.size().height() == 800
     window.reset_rotation_button.click()
@@ -196,6 +210,111 @@ def test_preview_pan_rotate_and_zoom_are_view_only(gui_settings):
     assert window.status_label.text() == "Preview view reset to 100% and 0°."
     window.close()
     assert application is not None
+
+
+def test_output_size_and_rotation_inputs_are_included_in_export_settings(sample_ims, gui_settings):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+    window.preview_pixmap = QPixmap(100, 80)
+
+    window._set_preview_zoom(2.5)
+    view_only_settings = window._current_settings()
+    assert view_only_settings is not None
+    assert view_only_settings.zoom_factor == 1.0
+    window.output_zoom_input.setValue(175.0)
+    window.rotation_input.setValue(-32.5)
+    settings = window._current_settings()
+
+    assert settings is not None
+    assert settings.zoom_factor == pytest.approx(1.75)
+    assert settings.rotation_degrees == pytest.approx(-32.5)
+    assert window.preview_zoom == pytest.approx(2.5)
+    assert window._preview_refresh_pending
+    window._preview_timer.stop()
+    window.close()
+    assert application is not None
+
+
+def test_preview_refresh_bakes_rotation_then_draws_scale_bar_at_bottom_right(tmp_path):
+    QApplication.instance() or QApplication([])
+    source = tmp_path / "preview-scale.tif"
+    tifffile.imwrite(
+        source,
+        np.arange(80 * 100, dtype=np.uint16).reshape(80, 100),
+        photometric="minisblack",
+        resolution=(10_000, 10_000),
+        resolutionunit="CENTIMETER",
+        metadata=None,
+    )
+    settings = ExportSettings(
+        z_start=1,
+        z_end=1,
+        channel_indices=(0,),
+        merge_channel_indices=(0,),
+        scale_bar=ScaleBarSettings(
+            enabled=True,
+            length_um=20.0,
+            thickness_px=3,
+            font_size_px=10,
+        ),
+        output=ImageOutputSettings(width_px=100, height_px=100, resize_mode="fit"),
+    )
+    worker = PreviewWorker(
+        source,
+        settings,
+        {},
+        (0,),
+        target_width=100,
+        target_height=100,
+        view_rotation_degrees=90.0,
+    )
+    outcomes = []
+    failures = []
+    worker.finished.connect(outcomes.append)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert not failures
+    assert len(outcomes) == 1
+    result = outcomes[0]
+    assert isinstance(result, PreviewRenderResult)
+    assert result.baked_rotation_degrees == 90.0
+    white_pixels = np.argwhere(np.all(result.image == 255, axis=2))
+    assert white_pixels[:, 0].max() > result.image.shape[0] * 0.75
+    assert white_pixels[:, 1].max() > result.image.shape[1] * 0.75
+
+
+def test_completed_preview_refresh_preserves_angle_and_reanchors_rotation_state(gui_settings):
+    QApplication.instance() or QApplication([])
+    window = IMSFigureExporterWindow(gui_settings)
+    window.preview_pixmap = QPixmap(100, 80)
+    window.preview_full_size = (100, 80)
+    window._rotate_preview(45.0)
+    level = ResolutionLevelInfo(0, 100, 80, 1)
+    result = PreviewRenderResult(
+        image=np.zeros((80, 100, 3), dtype=np.uint8),
+        full_size=(100, 80),
+        level=level,
+        available_levels=(level,),
+        baked_rotation_degrees=45.0,
+    )
+
+    window._preview_finished(result)
+
+    assert window.preview_baked_rotation_degrees == 45.0
+    assert window.preview_rotation_degrees == 0.0
+    assert window._preview_total_rotation() == 45.0
+    assert "45°" in window.zoom_label.text()
+    window._rotate_preview(15.0)
+    assert window.preview_rotation_degrees == 15.0
+    assert window._preview_total_rotation() == 60.0
+    window.close()
 
 
 def test_cell_counting_dialog_suggests_nuclear_channel_and_builds_manual_roi(
@@ -282,6 +401,147 @@ def test_parameter_change_schedules_preview_using_selected_limit(sample_ims, gui
     assert selections[0].include_in_merge
     assert selections[1].export_single
     assert selections[1].include_in_merge
+
+    window._preview_timer.stop()
+    window.close()
+    assert application is not None
+
+
+def test_paused_refresh_limit_defers_automatic_refresh_but_allows_manual(
+    sample_ims, gui_settings, monkeypatch
+):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+    window.refresh_limit_actions[0].trigger()
+
+    window.channel_controls[0].gamma.setValue(1.5)
+
+    assert window.preview_refresh_interval_ms == 0
+    assert window._preview_refresh_pending
+    assert not window._preview_timer.isActive()
+    assert "paused" in window.status_label.text().lower()
+
+    starts = []
+    monkeypatch.setattr(window, "_start_preview", lambda show_warnings: starts.append(show_warnings))
+    window.update_preview()
+
+    assert starts == [True]
+    assert not window._preview_refresh_pending
+    window.close()
+    assert application is not None
+
+
+def test_switching_batch_files_restores_temporary_edits_and_preview_view(
+    sample_ims, tmp_path, gui_settings, monkeypatch
+):
+    application = QApplication.instance() or QApplication([])
+    second_path = tmp_path / "second.ims"
+    shutil.copyfile(sample_ims, second_path)
+    with IMSReader(sample_ims) as reader:
+        first_metadata = reader.metadata
+    with IMSReader(second_path) as reader:
+        second_metadata = reader.metadata
+    assert first_metadata is not None
+    assert second_metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.preview_refresh_interval_ms = 0
+    monkeypatch.setattr(window, "update_preview", lambda: None)
+    window._activate_metadata(first_metadata, sample_ims)
+
+    first_controls = window.channel_controls[0]
+    first_controls.minimum.setValue(3.0)
+    first_controls.maximum.setValue(18.0)
+    first_controls.gamma.setValue(1.7)
+    first_controls.color_override = (0.2, 0.4, 0.8)
+    window._set_color_swatch(first_controls.color_swatch, first_controls.color_override)
+    window.channel_controls[1].include.setChecked(False)
+    window.z_start.setValue(2)
+    window.z_end.setValue(3)
+    window.red_to_magenta.setChecked(False)
+    window.include_scale_bar.setChecked(True)
+    window.auto_scale.setChecked(False)
+    window.scale_length.setValue(75.0)
+    window.scale_thickness.setValue(17)
+    window.scale_font_size.setValue(61)
+    window.preview_pixmap = QPixmap(320, 200)
+    window.preview_pixmap.fill(QColor(20, 40, 60))
+    window.preview_full_size = (320, 200)
+    window.preview_zoom = 2.25
+    window.output_zoom_factor = 1.6
+    window.preview_baked_rotation_degrees = 30.0
+    window.preview_rotation_degrees = 15.0
+
+    window._activate_metadata(second_metadata, second_path)
+    window.channel_controls[0].gamma.setValue(0.4)
+    window.preview_zoom = 0.75
+    window.output_zoom_factor = 0.8
+
+    window._activate_metadata(first_metadata, sample_ims)
+
+    restored = window.channel_controls[0]
+    assert restored.minimum.value() == 3.0
+    assert restored.maximum.value() == 18.0
+    assert restored.gamma.value() == 1.7
+    assert restored.color_override == pytest.approx((0.2, 0.4, 0.8))
+    assert not window.channel_controls[1].include.isChecked()
+    assert (window.z_start.value(), window.z_end.value()) == (2, 3)
+    assert not window.red_to_magenta.isChecked()
+    assert not window.auto_scale.isChecked()
+    assert window.scale_length.value() == 75.0
+    assert window.scale_thickness.value() == 17
+    assert window.scale_font_size.value() == 61
+    assert window.preview_pixmap is not None
+    assert window.preview_pixmap.size() == QPixmap(320, 200).size()
+    assert window.preview_zoom == 2.25
+    assert window.output_zoom_factor == 1.6
+    assert window.output_zoom_input.value() == 160.0
+    assert window._preview_total_rotation() == 45.0
+
+    window._activate_metadata(second_metadata, second_path)
+    assert window.channel_controls[0].gamma.value() == 0.4
+    assert window.preview_zoom == 0.75
+    assert window.output_zoom_factor == 0.8
+    assert sample_ims.resolve() in window._file_state_cache
+    assert second_path.resolve() in window._file_state_cache
+    window.close()
+    assert application is not None
+
+
+def test_channel_color_swatch_opens_rgb_picker_and_updates_shared_color(
+    sample_ims,
+    gui_settings,
+    monkeypatch,
+):
+    application = QApplication.instance() or QApplication([])
+    with IMSReader(sample_ims) as reader:
+        metadata = reader.metadata
+    assert metadata is not None
+
+    window = IMSFigureExporterWindow(gui_settings)
+    window.metadata = metadata
+    window._populate_channels(metadata)
+    chosen = QColor(12, 34, 200)
+    monkeypatch.setattr(QColorDialog, "getColor", lambda *_args, **_kwargs: chosen)
+
+    controls = window.channel_controls[0]
+    controls.color_swatch.click()
+
+    expected = (12 / 255, 34 / 255, 200 / 255)
+    assert controls.color_override == pytest.approx(expected)
+    assert window._display_adjustments()[0].color == pytest.approx(expected)
+    assert window._channel_selections()[0].color == pytest.approx(expected)
+    assert "rgb(12, 34, 200)" in controls.color_swatch.styleSheet()
+    assert "R 12, G 34, B 200" in controls.color_swatch.toolTip()
+    assert window.output_image_actions[(0,)].text() == "[Blue] Green"
+    assert window._preview_refresh_pending
+    assert window._preview_timer.isActive()
 
     window._preview_timer.stop()
     window.close()
@@ -511,7 +771,7 @@ def test_menu_settings_persist_between_windows(tmp_path):
         {corrected_path: MetadataCorrection(500.0, 400.0, 3.5)}
     )
     first._save_export_settings()
-    first.refresh_limit_actions[5000].trigger()
+    first.refresh_limit_actions[0].trigger()
     first.close()
 
     second_settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
@@ -525,8 +785,8 @@ def test_menu_settings_persist_between_windows(tmp_path):
     assert second.output_directory == tmp_path / "saved-output"
     assert second.fiji_directory == tmp_path / "Fiji.app"
     assert second.metadata_corrections[corrected_path] == MetadataCorrection(500.0, 400.0, 3.5)
-    assert second.preview_refresh_interval_ms == 5000
-    assert second.refresh_limit_actions[5000].isChecked()
+    assert second.preview_refresh_interval_ms == 0
+    assert second.refresh_limit_actions[0].isChecked()
     second.close()
     assert application is not None
 

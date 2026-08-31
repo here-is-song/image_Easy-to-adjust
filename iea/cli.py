@@ -87,6 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep red channel colors instead of converting red-like colors to magenta",
     )
+    parser.add_argument(
+        "--zoom",
+        type=float,
+        default=1.0,
+        help="Centre zoom written to the exported image (for example 1.5 for 150%%)",
+    )
+    parser.add_argument(
+        "--rotation",
+        type=float,
+        default=0.0,
+        help="Clockwise rotation written to the exported image, in degrees",
+    )
     return parser
 
 
@@ -175,6 +187,8 @@ def run(argv: list[str] | None = None) -> int:
                     font_size_px=args.scale_bar_font_size_px,
                 ),
                 output=ImageOutputSettings(format=args.output_format),
+                zoom_factor=args.zoom,
+                rotation_degrees=args.rotation,
             )
             results = []
             if args.channels and args.merge:

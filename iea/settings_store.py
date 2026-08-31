@@ -44,7 +44,7 @@ class SettingsStore:
         saved_directory = str(self.settings.value("export/output_directory", "")).strip()
         last_input_directory = str(self.settings.value("input/last_directory", "")).strip()
         interval = self.settings.value("preview/refresh_interval_ms", 1000, type=int)
-        if interval not in {500, 1000, 2000, 5000}:
+        if interval not in {0, 500, 1000, 2000, 5000}:
             interval = 1000
         return StoredApplicationSettings(
             output=ImageOutputSettings(

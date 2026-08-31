@@ -25,6 +25,7 @@ def test_batch_channels_match_by_name_when_target_order_differs(sample_ims):
             2.0,
             15.0,
             0.8,
+            (0.1, 0.2, 0.3),
             export_single=True,
             include_in_merge=False,
         ),
@@ -45,7 +46,7 @@ def test_batch_channels_match_by_name_when_target_order_differs(sample_ims):
     assert matched.settings.resolved_single_channel_indices == (1,)
     assert matched.settings.resolved_merge_channel_indices == (0,)
     assert matched.display_adjustments == {
-        1: DisplayAdjustmentSettings(2.0, 15.0, 0.8),
+        1: DisplayAdjustmentSettings(2.0, 15.0, 0.8, (0.1, 0.2, 0.3)),
         0: DisplayAdjustmentSettings(1.0, 20.0, 1.4),
     }
     assert not matched.warnings

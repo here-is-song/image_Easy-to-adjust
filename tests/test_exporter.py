@@ -11,6 +11,7 @@ from iea.exporter import (
     export_merge,
     export_single_channels,
     format_ppt_summary,
+    prepare_output_image,
     render_merge,
     render_single_channel,
     write_export_info,
@@ -91,6 +92,62 @@ def test_red_to_magenta_toggle_changes_merge_rendering(sample_ims):
     assert np.all(red[..., 1:] == 0)
 
 
+def test_prepare_output_image_applies_rotation_and_centre_zoom(sample_ims):
+    image = np.arange(4 * 6, dtype=np.uint8).reshape(4, 6)
+    rotated_settings = ExportSettings(
+        z_start=1,
+        z_end=1,
+        channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+        rotation_degrees=90.0,
+    )
+    zoomed_settings = replace(rotated_settings, rotation_degrees=0.0, zoom_factor=2.0)
+
+    with IMSReader(sample_ims) as reader:
+        rotated, _ = prepare_output_image(image, reader, rotated_settings)
+        zoomed, _ = prepare_output_image(image, reader, zoomed_settings)
+
+    np.testing.assert_array_equal(rotated, np.rot90(image, k=-1))
+    assert rotated.shape == (6, 4)
+    assert zoomed.shape == image.shape
+    assert zoomed[0, 0] > image[0, 0]
+    assert zoomed[-1, -1] < image[-1, -1]
+
+
+def test_manual_rgb_color_is_shared_by_preview_merge_and_single_tiff(sample_ims, tmp_path):
+    custom_red = (1.0, 0.0, 0.0)
+    settings = ExportSettings(
+        z_start=1,
+        z_end=3,
+        channel_indices=(0,),
+        merge_channel_indices=(0,),
+        scale_bar=ScaleBarSettings(enabled=False),
+        red_to_magenta=True,
+    )
+    adjustments = {
+        0: DisplayAdjustmentSettings(0.0, 20.0, gamma=1.0, color=custom_red),
+    }
+
+    with IMSReader(sample_ims) as reader:
+        preview, preview_records = render_merge(reader, settings, adjustments)
+        single = export_single_channels(reader, settings, tmp_path, adjustments)[0]
+        info_path = write_export_info(reader, settings, [single], tmp_path)
+
+    exported = tifffile.imread(single.path)
+    payload = json.loads(info_path.read_text(encoding="utf-8"))
+    assert preview.shape == exported.shape == (4, 5, 3)
+    assert np.all(preview[..., 0] > 0)
+    assert np.all(preview[..., 1:] == 0)
+    np.testing.assert_array_equal(exported, preview)
+    assert preview_records[0].original_color == (0.0, 1.0, 0.0)
+    assert preview_records[0].output_color == custom_red
+    assert preview_records[0].color_overridden
+    assert single.channel_records[0].output_color == custom_red
+    assert payload["channels"][0]["original_color"] == [0.0, 1.0, 0.0]
+    assert payload["channels"][0]["output_color"] == [1.0, 0.0, 0.0]
+    assert payload["channels"][0]["color_overridden"] is True
+
+
 def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     output_dir = tmp_path / "output"
     settings = ExportSettings(
@@ -114,6 +171,8 @@ def test_export_info_records_actual_export_settings(sample_ims, tmp_path):
     assert payload["output_width_px"] == 640
     assert payload["output_height_px"] == 480
     assert payload["output_dpi"] == 600
+    assert payload["zoom_factor"] == 1.0
+    assert payload["rotation_degrees"] == 0.0
     assert payload["single_channel_indices"] == [0, 1]
     assert payload["merge_channel_indices"] == [0, 1]
     assert payload["merge_channel_groups"] == [[0, 1]]

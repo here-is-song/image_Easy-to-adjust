@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, QRectF, QSettings, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
+    QColor,
     QDesktopServices,
     QIcon,
     QImage,
@@ -22,6 +23,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -96,13 +98,56 @@ class ChannelControls:
     """Widgets associated with one channel; parsing remains outside the GUI layer."""
 
     include: QCheckBox
+    color_swatch: QPushButton
     minimum: QDoubleSpinBox
     maximum: QDoubleSpinBox
     gamma: QDoubleSpinBox
     minimum_slider: QSlider
     maximum_slider: QSlider
     gamma_slider: QSlider
+    color_override: tuple[float, float, float] | None = None
     use_data_minmax: QCheckBox | None = None
+
+
+@dataclass(frozen=True)
+class CachedChannelState:
+    """One channel's temporary edits while the application remains open."""
+
+    included: bool
+    display_min: float
+    display_max: float
+    gamma: float
+    color_override: tuple[float, float, float] | None
+    use_data_minmax: bool | None
+
+
+@dataclass
+class CachedFileState:
+    """Editable controls and preview view cached separately for one source file."""
+
+    channels: dict[int, CachedChannelState]
+    output_name_groups: tuple[tuple[str, ...], ...]
+    preview_selection: object
+    z_start: int
+    z_end: int
+    objective_override: object
+    red_to_magenta: bool
+    include_scale_bar: bool
+    auto_scale: bool
+    scale_length: float
+    scale_thickness: int
+    scale_font_size: int
+    preview_pixmap: QPixmap | None
+    preview_full_size: tuple[int, int] | None
+    preview_resolution_level: ResolutionLevelInfo | None
+    preview_available_levels: tuple[ResolutionLevelInfo, ...]
+    preview_zoom: float
+    output_zoom_factor: float
+    preview_rotation_degrees: float
+    preview_baked_rotation_degrees: float
+    scroll_x: int
+    scroll_y: int
+    refresh_pending: bool
 
 
 class IMSFigureExporterWindow(QMainWindow):
@@ -146,13 +191,20 @@ class IMSFigureExporterWindow(QMainWindow):
         self._worker: QObject | None = None
         self.preview_pixmap: QPixmap | None = None
         self.preview_zoom = 1.0
+        self.output_zoom_factor = 1.0
         self.preview_rotation_degrees = 0.0
+        self.preview_baked_rotation_degrees = 0.0
         self.preview_full_size: tuple[int, int] | None = None
         self.preview_resolution_level: ResolutionLevelInfo | None = None
         self.preview_available_levels: tuple[ResolutionLevelInfo, ...] = ()
         self.cell_counting_plugins = load_cell_counting_plugins()
         self.last_cell_count_result: CellCountingResult | None = None
+        self._active_path: Path | None = None
+        self._file_state_cache: dict[Path, CachedFileState] = {}
+        self._restoring_file_state = False
+        self._restored_preview_view = False
         self._preview_refresh_pending = False
+        self._manual_preview_refresh_pending = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._run_scheduled_preview)
@@ -221,6 +273,7 @@ class IMSFigureExporterWindow(QMainWindow):
             ("1 per second", 1000),
             ("Every 2 seconds", 2000),
             ("Every 5 seconds", 5000),
+            ("Paused", 0),
         ):
             action = QAction(label, self, checkable=True)
             action.setData(interval_ms)
@@ -386,6 +439,26 @@ class IMSFigureExporterWindow(QMainWindow):
         self.reset_rotation_button.setToolTip("Reset preview rotation")
         self.reset_rotation_button.clicked.connect(self.reset_preview_rotation)
         preview_header.addWidget(self.reset_rotation_button)
+        preview_header.addWidget(QLabel("Output size:"))
+        self.output_zoom_input = QDoubleSpinBox()
+        self.output_zoom_input.setRange(2.0, 1600.0)
+        self.output_zoom_input.setDecimals(1)
+        self.output_zoom_input.setSingleStep(5.0)
+        self.output_zoom_input.setSuffix(" %")
+        self.output_zoom_input.setValue(100.0)
+        self.output_zoom_input.setToolTip("Image-content size written to Preview and exported images")
+        self.output_zoom_input.valueChanged.connect(self._output_zoom_input_changed)
+        preview_header.addWidget(self.output_zoom_input)
+        preview_header.addWidget(QLabel("Rotation:"))
+        self.rotation_input = QDoubleSpinBox()
+        self.rotation_input.setRange(-180.0, 180.0)
+        self.rotation_input.setDecimals(1)
+        self.rotation_input.setSingleStep(1.0)
+        self.rotation_input.setSuffix(" °")
+        self.rotation_input.setValue(0.0)
+        self.rotation_input.setToolTip("Clockwise rotation written to Preview and exported images")
+        self.rotation_input.valueChanged.connect(self._rotation_input_changed)
+        preview_header.addWidget(self.rotation_input)
         self.zoom_label = QLabel("100%")
         preview_header.addWidget(self.zoom_label)
         preview_header.addStretch(1)
@@ -395,8 +468,8 @@ class IMSFigureExporterWindow(QMainWindow):
         self.preview_label.setMinimumSize(1, 1)
         self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
         self.preview_label.setToolTip(
-            "Mouse wheel: zoom · Left drag: pan · Right drag: rotate\n"
-            "View transforms do not change exported images."
+            "Mouse wheel: view-only zoom · Left drag: view-only pan · Right drag: output rotation\n"
+            "Output size and rotation change exported images."
         )
         self.preview_label.pan_requested.connect(self._pan_preview)
         self.preview_label.rotation_requested.connect(self._rotate_preview)
@@ -658,17 +731,124 @@ class IMSFigureExporterWindow(QMainWindow):
         }
         self._apply_loaded_metadata(loaded, statuses, outcome.errors)
 
-    def _activate_metadata(self, metadata: IMSMetadata, requested_path: Path | None = None) -> None:
+    def _cache_active_file_state(self) -> None:
+        """Keep the active file's edits in memory before another file replaces it."""
+
+        if self._active_path is None or self.metadata is None or not self.channel_controls:
+            return
+        channels = {
+            index: CachedChannelState(
+                included=controls.include.isChecked(),
+                display_min=controls.minimum.value(),
+                display_max=controls.maximum.value(),
+                gamma=controls.gamma.value(),
+                color_override=controls.color_override,
+                use_data_minmax=(
+                    controls.use_data_minmax.isChecked()
+                    if controls.use_data_minmax is not None
+                    else None
+                ),
+            )
+            for index, controls in self.channel_controls.items()
+        }
+        pixmap = (
+            self.preview_pixmap.copy()
+            if self.preview_pixmap is not None and not self.preview_pixmap.isNull()
+            else None
+        )
+        self._file_state_cache[self._active_path] = CachedFileState(
+            channels=channels,
+            output_name_groups=self._checked_output_name_groups(),
+            preview_selection=self.preview_combo.currentData(),
+            z_start=self.z_start.value(),
+            z_end=self.z_end.value(),
+            objective_override=self.objective_combo.currentData(),
+            red_to_magenta=self.red_to_magenta.isChecked(),
+            include_scale_bar=self.include_scale_bar.isChecked(),
+            auto_scale=self.auto_scale.isChecked(),
+            scale_length=self.scale_length.value(),
+            scale_thickness=self.scale_thickness.value(),
+            scale_font_size=self.scale_font_size.value(),
+            preview_pixmap=pixmap,
+            preview_full_size=self.preview_full_size,
+            preview_resolution_level=self.preview_resolution_level,
+            preview_available_levels=self.preview_available_levels,
+            preview_zoom=self.preview_zoom,
+            output_zoom_factor=self.output_zoom_factor,
+            preview_rotation_degrees=self.preview_rotation_degrees,
+            preview_baked_rotation_degrees=self.preview_baked_rotation_degrees,
+            scroll_x=self.preview_scroll.horizontalScrollBar().value(),
+            scroll_y=self.preview_scroll.verticalScrollBar().value(),
+            refresh_pending=self._preview_refresh_pending,
+        )
+
+    def _restore_cached_controls(self, state: CachedFileState) -> None:
+        for index, channel_state in state.channels.items():
+            controls = self.channel_controls.get(index)
+            if controls is None:
+                continue
+            controls.include.setChecked(channel_state.included)
+            controls.minimum.setValue(channel_state.display_min)
+            controls.maximum.setValue(channel_state.display_max)
+            controls.gamma.setValue(channel_state.gamma)
+            controls.color_override = channel_state.color_override
+            source_color = self.metadata.channels[index].color if self.metadata is not None else (1.0, 1.0, 1.0)
+            self._set_color_swatch(controls.color_swatch, channel_state.color_override or source_color)
+            if controls.use_data_minmax is not None and channel_state.use_data_minmax is not None:
+                controls.use_data_minmax.setChecked(channel_state.use_data_minmax)
+        self._sync_output_action_availability()
+        self._refresh_output_color_labels()
+
+    def _restore_preview_selection(self, selection: object) -> None:
+        index = next(
+            (
+                position
+                for position in range(self.preview_combo.count())
+                if self.preview_combo.itemData(position) == selection
+            ),
+            -1,
+        )
+        if index >= 0:
+            self.preview_combo.setCurrentIndex(index)
+
+    def _restore_cached_scroll(self, path: Path, x: int, y: int) -> None:
+        if self._active_path != path:
+            return
+        self.preview_scroll.horizontalScrollBar().setValue(x)
+        self.preview_scroll.verticalScrollBar().setValue(y)
+
+    def _activate_metadata(
+        self,
+        metadata: IMSMetadata,
+        requested_path: Path | None = None,
+        *,
+        invalidate_cached_preview: bool = False,
+    ) -> None:
+        self._cache_active_file_state()
+        self._preview_timer.stop()
+        self._preview_detail_timer.stop()
+        self._manual_preview_refresh_pending = False
+        active_path = requested_path or metadata.source_path
+        cache_key = active_path.resolve()
+        state = self._file_state_cache.get(cache_key)
+        if state is not None and invalidate_cached_preview:
+            state.preview_pixmap = None
+            state.preview_resolution_level = None
+            state.preview_available_levels = ()
+        self._active_path = cache_key
         self.metadata = metadata
+        self._restoring_file_state = True
         self.preview_pixmap = None
         self.preview_full_size = self._preview_base_size()
         self.preview_resolution_level = None
         self.preview_available_levels = ()
         self.preview_zoom = 1.0
+        self.output_zoom_factor = 1.0
         self.preview_rotation_degrees = 0.0
+        self.preview_baked_rotation_degrees = 0.0
+        self._restored_preview_view = state is not None
         self.preview_label.clear()
         self.preview_label.setText("Loading preview…")
-        active_path = requested_path or metadata.source_path
         self.file_label.setText(str(active_path))
         voxel_text = " x ".join(
             f"{value:.6g}" if value is not None else "N/A"
@@ -693,11 +873,26 @@ class IMSFigureExporterWindow(QMainWindow):
         )
         self._update_warning_display(metadata.warnings)
         self._sync_output_folder_controls()
+        if state is not None:
+            self.output_selection_name_groups = state.output_name_groups
         self._populate_channels(metadata)
         self.z_start.setRange(1, metadata.size_z)
         self.z_end.setRange(1, metadata.size_z)
-        self.z_start.setValue(1)
-        self.z_end.setValue(metadata.size_z)
+        self.z_end.setValue(min(metadata.size_z, state.z_end) if state is not None else metadata.size_z)
+        self.z_start.setValue(min(self.z_end.value(), state.z_start) if state is not None else 1)
+        if state is not None:
+            self._restore_cached_controls(state)
+            self.red_to_magenta.setChecked(state.red_to_magenta)
+            self.include_scale_bar.setChecked(state.include_scale_bar)
+            self.auto_scale.setChecked(state.auto_scale)
+            self.scale_length.setValue(state.scale_length)
+            self.scale_thickness.setValue(state.scale_thickness)
+            self.scale_font_size.setValue(state.scale_font_size)
+            objective_index = self.objective_combo.findData(state.objective_override)
+            self.objective_combo.setCurrentIndex(max(0, objective_index))
+            self._restore_preview_selection(state.preview_selection)
+        self._toggle_scale_controls(self.include_scale_bar.isChecked())
+        self._toggle_scale_length(self.auto_scale.isChecked())
         self._update_z_info()
         self._update_objective_display()
         self._update_export_enabled()
@@ -710,9 +905,31 @@ class IMSFigureExporterWindow(QMainWindow):
         self.status_label.setText(
             f"{len(self.batch_metadata)} microscopy file(s) loaded. Active: {active_path.name}.{status_suffix}"
         )
-        self._preview_timer.stop()
-        self._preview_refresh_pending = False
-        self.update_preview()
+        self._preview_refresh_pending = state.refresh_pending if state is not None else False
+        if state is not None:
+            self.preview_full_size = state.preview_full_size
+            self.preview_resolution_level = state.preview_resolution_level
+            self.preview_available_levels = state.preview_available_levels
+            self.preview_zoom = state.preview_zoom
+            self.output_zoom_factor = state.output_zoom_factor
+            self.preview_rotation_degrees = state.preview_rotation_degrees
+            self.preview_baked_rotation_degrees = state.preview_baked_rotation_degrees
+        self._sync_transform_inputs()
+        if state is not None and state.preview_pixmap is not None and not state.preview_pixmap.isNull():
+            self.preview_pixmap = state.preview_pixmap.copy()
+            self._render_preview_pixmap()
+            QTimer.singleShot(
+                0,
+                lambda path=cache_key, x=state.scroll_x, y=state.scroll_y: self._restore_cached_scroll(
+                    path, x, y
+                ),
+            )
+            self.status_label.setText(f"Restored temporary edits and preview for {active_path.name}.")
+        self._restoring_file_state = False
+        if self.preview_pixmap is None:
+            self.update_preview()
+        elif self._preview_refresh_pending and self.preview_refresh_interval_ms > 0:
+            self._preview_timer.start(self.preview_refresh_interval_ms)
 
     @Slot()
     def edit_image_metadata(self) -> None:
@@ -738,7 +955,7 @@ class IMSFigureExporterWindow(QMainWindow):
         self.settings_store.save_metadata_corrections(self.metadata_corrections)
         effective = apply_metadata_correction(source, None if correction.is_empty else correction)
         self.batch_metadata[active_path] = effective
-        self._activate_metadata(effective, active_path)
+        self._activate_metadata(effective, active_path, invalidate_cached_preview=True)
         self.status_label.setText(f"{status} Original microscopy file was not modified.")
 
     @Slot()
@@ -748,7 +965,7 @@ class IMSFigureExporterWindow(QMainWindow):
             return
         path = Path(str(selected[0].data(0, Qt.ItemDataRole.UserRole)))
         metadata = self.batch_metadata.get(path)
-        if metadata is not None and metadata is not self.metadata:
+        if metadata is not None and path.resolve() != self._active_path:
             self._activate_metadata(metadata, path)
 
     @Slot(QTreeWidgetItem, int)
@@ -799,10 +1016,14 @@ class IMSFigureExporterWindow(QMainWindow):
             layout = QGridLayout(row)
             include = QCheckBox(channel.name)
             include.setChecked(True)
-            swatch = QLabel()
-            rgb = tuple(round(component * 255) for component in channel.color)
-            swatch.setStyleSheet(f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); border: 1px solid #666;")
-            swatch.setFixedSize(18, 18)
+            swatch = QPushButton()
+            swatch.setFixedSize(22, 22)
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.setAccessibleName(f"Change RGB color for {channel.name}")
+            self._set_color_swatch(swatch, channel.color)
+            swatch.clicked.connect(
+                lambda _checked=False, channel_index=channel.index: self._choose_channel_color(channel_index)
+            )
             minimum = self._range_spinbox(channel.display_min, 0.0)
             maximum = self._range_spinbox(channel.display_max, 1.0)
             gamma = self._gamma_spinbox(channel.display_gamma)
@@ -849,14 +1070,15 @@ class IMSFigureExporterWindow(QMainWindow):
                 layout.addWidget(use_data_minmax, 5, 0, 1, 3)
             self.channel_rows_layout.addWidget(row)
             self.channel_controls[channel.index] = ChannelControls(
-                include,
-                minimum,
-                maximum,
-                gamma,
-                minimum_slider,
-                maximum_slider,
-                gamma_slider,
-                use_data_minmax,
+                include=include,
+                color_swatch=swatch,
+                minimum=minimum,
+                maximum=maximum,
+                gamma=gamma,
+                minimum_slider=minimum_slider,
+                maximum_slider=maximum_slider,
+                gamma_slider=gamma_slider,
+                use_data_minmax=use_data_minmax,
             )
         self._populate_output_images_menu(metadata)
         self._populate_preview_choices()
@@ -883,6 +1105,38 @@ class IMSFigureExporterWindow(QMainWindow):
         spinbox.setSingleStep(0.05)
         spinbox.setValue(value)
         return spinbox
+
+    @staticmethod
+    def _set_color_swatch(swatch: QPushButton, color: tuple[float, float, float]) -> None:
+        rgb = tuple(round(min(max(component, 0.0), 1.0) * 255) for component in color)
+        swatch.setStyleSheet(
+            f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); "
+            "border: 1px solid #8A8A8A; border-radius: 3px;"
+        )
+        swatch.setToolTip(f"Click to change RGB color (R {rgb[0]}, G {rgb[1]}, B {rgb[2]})")
+
+    @Slot(int)
+    def _choose_channel_color(self, channel_index: int) -> None:
+        if self.metadata is None or channel_index not in self.channel_controls:
+            return
+        channel = self.metadata.channels[channel_index]
+        controls = self.channel_controls[channel_index]
+        current = controls.color_override or channel.color
+        selected = QColorDialog.getColor(
+            QColor.fromRgbF(*current),
+            self,
+            f"Select RGB Color — {channel.name}",
+        )
+        if not selected.isValid():
+            return
+        controls.color_override = (selected.redF(), selected.greenF(), selected.blueF())
+        self._set_color_swatch(controls.color_swatch, controls.color_override)
+        self._refresh_output_color_labels()
+        self.status_label.setText(
+            f"Channel color updated: {channel.name} → "
+            f"RGB({selected.red()}, {selected.green()}, {selected.blue()})."
+        )
+        self._schedule_preview_refresh()
 
     def _populate_output_images_menu(self, metadata: IMSMetadata) -> None:
         """Build checkable single-, two-, and three-color export choices."""
@@ -945,7 +1199,11 @@ class IMSFigureExporterWindow(QMainWindow):
 
     @staticmethod
     def _channel_menu_label(channel: ChannelMetadata) -> str:
-        red, green, blue = channel.color
+        return IMSFigureExporterWindow._channel_menu_label_for_color(channel.name, channel.color)
+
+    @staticmethod
+    def _channel_menu_label_for_color(name: str, color: tuple[float, float, float]) -> str:
+        red, green, blue = color
         maximum = max(red, green, blue)
         if maximum <= 0:
             color_name = "Gray"
@@ -960,7 +1218,20 @@ class IMSFigureExporterWindow(QMainWindow):
                 (True, False, True): "Magenta",
                 (True, True, True): "White",
             }.get(active, "Mixed")
-        return f"[{color_name}] {channel.name}"
+        return f"[{color_name}] {name}"
+
+    def _refresh_output_color_labels(self) -> None:
+        if self.metadata is None:
+            return
+        channels = {channel.index: channel for channel in self.metadata.channels}
+        for group, action in self.output_image_actions.items():
+            labels: list[str] = []
+            for index in group:
+                channel = channels[index]
+                controls = self.channel_controls[index]
+                color = controls.color_override or channel.color
+                labels.append(self._channel_menu_label_for_color(channel.name, color))
+            action.setText(" + ".join(labels))
 
     def _set_all_output_actions(self, checked: bool) -> None:
         for action in self.output_image_actions.values():
@@ -1210,6 +1481,8 @@ class IMSFigureExporterWindow(QMainWindow):
                 dpi=self.output_dpi,
                 resize_mode=self.output_resize_mode,
             ),
+            zoom_factor=self.output_zoom_factor,
+            rotation_degrees=self._preview_total_rotation(),
         )
 
     def _display_adjustments(self) -> dict[int, DisplayAdjustmentSettings]:
@@ -1220,6 +1493,7 @@ class IMSFigureExporterWindow(QMainWindow):
                 display_min=None if use_fallback else controls.minimum.value(),
                 display_max=None if use_fallback else controls.maximum.value(),
                 gamma=controls.gamma.value(),
+                color=controls.color_override,
             )
         return adjustments
 
@@ -1247,6 +1521,7 @@ class IMSFigureExporterWindow(QMainWindow):
                     display_min=display_adjustment.display_min,
                     display_max=display_adjustment.display_max,
                     gamma=display_adjustment.gamma,
+                    color=display_adjustment.color,
                     export_single=channel.index in single_indices,
                     include_in_merge=channel.index in merge_indices,
                 )
@@ -1257,6 +1532,12 @@ class IMSFigureExporterWindow(QMainWindow):
     def update_preview(self) -> None:
         self._preview_timer.stop()
         self._preview_refresh_pending = False
+        if self._thread is not None:
+            self._preview_refresh_pending = True
+            self._manual_preview_refresh_pending = True
+            self.status_label.setText("Manual preview refresh queued…")
+            return
+        self._manual_preview_refresh_pending = False
         self._start_preview(show_warnings=True)
 
     def _start_preview(self, show_warnings: bool) -> None:
@@ -1283,7 +1564,7 @@ class IMSFigureExporterWindow(QMainWindow):
             else:
                 self.status_label.setText(message)
             return
-        if self.preview_pixmap is None:
+        if self.preview_pixmap is None and not self._restored_preview_view:
             self._set_initial_preview_zoom()
         target_width, target_height = self._preview_target_size()
         active_path = self._active_source_path() or self.metadata.source_path
@@ -1295,13 +1576,19 @@ class IMSFigureExporterWindow(QMainWindow):
             target_width,
             target_height,
             self.metadata_corrections.get(active_path.resolve()),
+            self._preview_total_rotation(),
+            self.output_zoom_factor,
         )
         self._run_worker(worker, self._preview_finished)
 
     def _schedule_preview_refresh(self, *_: object) -> None:
-        if self.metadata is None:
+        if self.metadata is None or self._restoring_file_state:
             return
         self._preview_refresh_pending = True
+        if self.preview_refresh_interval_ms == 0:
+            self._preview_timer.stop()
+            self.status_label.setText("Automatic preview refresh paused; use Refresh Preview to update.")
+            return
         self._preview_timer.start(self.preview_refresh_interval_ms)
         self.status_label.setText("Preview update scheduled…")
 
@@ -1320,7 +1607,9 @@ class IMSFigureExporterWindow(QMainWindow):
             return
         self.preview_refresh_interval_ms = int(action.data())
         self.settings_store.save_refresh_interval(self.preview_refresh_interval_ms)
-        if self._preview_refresh_pending:
+        if self.preview_refresh_interval_ms == 0:
+            self._preview_timer.stop()
+        elif self._preview_refresh_pending:
             self._preview_timer.start(self.preview_refresh_interval_ms)
         self.status_label.setText(f"Preview refresh limit: {action.text()}.")
 
@@ -1498,12 +1787,19 @@ class IMSFigureExporterWindow(QMainWindow):
 
     @Slot(object)
     def _preview_finished(self, image: object) -> None:
+        current_total_rotation = self._preview_total_rotation()
         if isinstance(image, PreviewRenderResult):
             result = image
             array = np.asarray(result.image)
             self.preview_full_size = result.full_size
             self.preview_resolution_level = result.level
             self.preview_available_levels = result.available_levels
+            self.preview_baked_rotation_degrees = self._normalized_preview_rotation(
+                result.baked_rotation_degrees
+            )
+            self.preview_rotation_degrees = self._normalized_preview_rotation(
+                current_total_rotation - self.preview_baked_rotation_degrees
+            )
         else:
             array = np.asarray(image)
             self.preview_full_size = (array.shape[1], array.shape[0])
@@ -1572,10 +1868,9 @@ class IMSFigureExporterWindow(QMainWindow):
         self._set_preview_zoom(min(width_ratio, height_ratio, 1.0))
 
     def _set_preview_zoom(self, zoom: float) -> None:
-        if self.preview_pixmap is None or self.preview_pixmap.isNull():
-            return
         self.preview_zoom = min(16.0, max(0.02, zoom))
-        self._render_preview_pixmap()
+        if self.preview_pixmap is not None and not self.preview_pixmap.isNull():
+            self._render_preview_pixmap()
         if self.metadata is not None:
             self._preview_detail_timer.start()
 
@@ -1601,9 +1896,10 @@ class IMSFigureExporterWindow(QMainWindow):
             return 1200, 1200
         pixel_ratio = max(1.0, self.preview_scroll.devicePixelRatioF())
         base_width, base_height = self._preview_base_size()
+        detail_zoom = self.preview_zoom * max(1.0, self.output_zoom_factor)
         return (
-            max(1, round(base_width * self.preview_zoom * pixel_ratio)),
-            max(1, round(base_height * self.preview_zoom * pixel_ratio)),
+            max(1, round(base_width * detail_zoom * pixel_ratio)),
+            max(1, round(base_height * detail_zoom * pixel_ratio)),
         )
 
     def _rotated_full_size(self) -> tuple[float, float]:
@@ -1642,8 +1938,10 @@ class IMSFigureExporterWindow(QMainWindow):
             else ""
         )
         self.zoom_label.setText(
-            f"{self.preview_zoom * 100:.0f}% · {self.preview_rotation_degrees:.0f}°{level_suffix}"
+            f"View {self.preview_zoom * 100:.0f}% · Output {self.output_zoom_factor * 100:.0f}% · "
+            f"{self._preview_total_rotation():.0f}°{level_suffix}"
         )
+        self._sync_transform_inputs()
 
     @Slot(float)
     def _zoom_preview_by_factor(self, factor: float) -> None:
@@ -1668,15 +1966,51 @@ class IMSFigureExporterWindow(QMainWindow):
 
     @Slot(float)
     def _rotate_preview(self, delta_degrees: float) -> None:
-        self.preview_rotation_degrees = (self.preview_rotation_degrees + delta_degrees) % 360.0
-        if self.preview_rotation_degrees > 180.0:
-            self.preview_rotation_degrees -= 360.0
+        self.preview_rotation_degrees = self._normalized_preview_rotation(
+            self.preview_rotation_degrees + delta_degrees
+        )
         self._render_preview_pixmap()
+        self._schedule_preview_refresh()
+
+    @staticmethod
+    def _normalized_preview_rotation(degrees: float) -> float:
+        normalized = float(degrees) % 360.0
+        return normalized - 360.0 if normalized > 180.0 else normalized
+
+    def _preview_total_rotation(self) -> float:
+        return self._normalized_preview_rotation(
+            self.preview_baked_rotation_degrees + self.preview_rotation_degrees
+        )
+
+    def _sync_transform_inputs(self) -> None:
+        self.output_zoom_input.blockSignals(True)
+        self.output_zoom_input.setValue(self.output_zoom_factor * 100.0)
+        self.output_zoom_input.blockSignals(False)
+        self.rotation_input.blockSignals(True)
+        self.rotation_input.setValue(self._preview_total_rotation())
+        self.rotation_input.blockSignals(False)
+
+    @Slot(float)
+    def _output_zoom_input_changed(self, percent: float) -> None:
+        self.output_zoom_factor = min(16.0, max(0.02, percent / 100.0))
+        self._sync_transform_inputs()
+        self._schedule_preview_refresh()
+
+    @Slot(float)
+    def _rotation_input_changed(self, degrees: float) -> None:
+        self.preview_rotation_degrees = self._normalized_preview_rotation(
+            degrees - self.preview_baked_rotation_degrees
+        )
+        self._render_preview_pixmap()
+        self._schedule_preview_refresh()
 
     @Slot()
     def reset_preview_rotation(self) -> None:
-        self.preview_rotation_degrees = 0.0
+        self.preview_rotation_degrees = self._normalized_preview_rotation(
+            -self.preview_baked_rotation_degrees
+        )
         self._render_preview_pixmap()
+        self._schedule_preview_refresh()
 
     @Slot()
     def reset_preview_view(self) -> None:
@@ -1684,7 +2018,9 @@ class IMSFigureExporterWindow(QMainWindow):
 
         if self.preview_pixmap is None or self.preview_pixmap.isNull():
             return
-        self.preview_rotation_degrees = 0.0
+        self.preview_rotation_degrees = self._normalized_preview_rotation(
+            -self.preview_baked_rotation_degrees
+        )
         self._set_preview_zoom(1.0)
         horizontal = self.preview_scroll.horizontalScrollBar()
         vertical = self.preview_scroll.verticalScrollBar()
@@ -1711,6 +2047,10 @@ class IMSFigureExporterWindow(QMainWindow):
             )
         )
         if desired.index != self.preview_resolution_level.index:
+            if self.preview_refresh_interval_ms == 0:
+                self._preview_refresh_pending = True
+                self.status_label.setText("Automatic preview refresh paused; use Refresh Preview to update.")
+                return
             self._start_preview(show_warnings=False)
 
     @Slot(object)
@@ -1821,7 +2161,10 @@ class IMSFigureExporterWindow(QMainWindow):
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
         self._update_export_enabled()
-        if self._preview_refresh_pending:
+        if self._manual_preview_refresh_pending:
+            self._manual_preview_refresh_pending = False
+            self._run_scheduled_preview()
+        elif self._preview_refresh_pending and self.preview_refresh_interval_ms > 0:
             self._preview_timer.start(self.preview_refresh_interval_ms)
 
     @Slot()

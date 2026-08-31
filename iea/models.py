@@ -32,6 +32,7 @@ class DisplayAdjustmentSettings:
     display_min: float | None
     display_max: float | None
     gamma: float | None = None
+    color: tuple[float, float, float] | None = None
 
     @property
     def display_range(self) -> tuple[float, float] | None:
@@ -119,6 +120,7 @@ class ChannelSelection:
     display_min: float | None = None
     display_max: float | None = None
     gamma: float | None = None
+    color: tuple[float, float, float] | None = None
     export_single: bool = True
     include_in_merge: bool = True
 
@@ -130,7 +132,7 @@ class ChannelSelection:
 
     @property
     def display_adjustment(self) -> DisplayAdjustmentSettings:
-        return DisplayAdjustmentSettings(self.display_min, self.display_max, self.gamma)
+        return DisplayAdjustmentSettings(self.display_min, self.display_max, self.gamma, self.color)
 
 
 @dataclass(frozen=True)
@@ -188,6 +190,8 @@ class ExportSettings:
     merge_channel_indices: tuple[int, ...] | None = None
     merge_channel_groups: tuple[tuple[int, ...], ...] | None = None
     metadata_correction: MetadataCorrection | None = None
+    zoom_factor: float = 1.0
+    rotation_degrees: float = 0.0
 
     @property
     def resolved_single_channel_indices(self) -> tuple[int, ...]:

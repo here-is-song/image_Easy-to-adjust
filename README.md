@@ -249,7 +249,7 @@ IEA.spec                    Windows 打包配置
 
 IEA 不是 Olympus、Evident、Imaris、Bitplane、Fiji、ImageJ 或 Cellpose 的官方项目，也未获得这些项目或公司的认可。相关名称只用于说明文件兼容性和工作流程。
 
-项目按 Song Xuanyu 的个人需求维护，外部用户不应预期长期兼容性、技术支持或特定功能路线。若要报告问题，请在 GitHub Issue 中使用可公开的最小复现信息，不要上传真实实验数据或包含个人信息的日志。
+项目按 Song Xuanyu 的个人需求维护，不应预期长期兼容性、技术支持或特定功能路线。若要报告问题，请在 GitHub Issue 中使用可公开的最小复现信息，不要上传真实实验数据或包含个人信息的日志。
 
 ## 许可证
 

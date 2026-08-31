@@ -2189,7 +2189,8 @@ class IMSFigureExporterWindow(QMainWindow):
             "About IEA",
             f"<h3>image_easy-to-adjust (IEA)</h3>"
             f"<p>Version {__version__}</p>"
-            "<p>This open-source software was developed by Song Xuanyu with assistance from Codex.</p>"
+            "<p>The source code for this software is publicly available. It was developed by Song Xuanyu "
+            "with assistance from Codex.</p>"
             "<p>IEA is designed for simple batch processing of microscopy image files and is currently "
             "developed primarily "
             "to meet the author's own workflow needs.</p>"
